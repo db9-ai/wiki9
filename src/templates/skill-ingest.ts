@@ -22,7 +22,7 @@ Process new source material into the wiki.
    - A directory goes to \`sources/YYYY-MM-DD/<original-directory>/\`
    - Preserve the original file or directory name whenever possible
    - If a name already exists inside that date folder, rename the incoming file or directory with a version suffix or timestamp
-5. Run \`db9-wiki index\` to see existing wiki pages
+5. Run \`wiki9 index\` to see existing wiki pages
 6. Analyze the source content and decide:
    - Which new wiki pages to create
    - Which existing pages to update with new information
@@ -38,7 +38,7 @@ Process new source material into the wiki.
    - created \\\`slug\\\` — reason
    - updated \\\`slug\\\` — what changed
    \`\`\`
-9. Run \`db9-wiki sync\` to update the search index and backup
+9. Run \`wiki9 sync\` to update the search index and backup
 
 ## Guidelines
 

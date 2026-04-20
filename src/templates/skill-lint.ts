@@ -8,7 +8,7 @@ Health-check the wiki for issues.
 
 ## Steps
 
-1. Run \`db9-wiki index\` to get all pages
+1. Run \`wiki9 index\` to get all pages
 2. Read all wiki pages from \`wiki/\`
 3. Check for:
    - **Broken links**: \`[[slug]]\` references pointing to non-existent pages
@@ -31,7 +31,7 @@ Health-check the wiki for issues.
    - updated \\\`slug\\\` — fix description
    - deleted \\\`slug\\\` — reason
    \`\`\`
-7. Run \`db9-wiki sync\`
+7. Run \`wiki9 sync\`
 
 ## Guidelines
 

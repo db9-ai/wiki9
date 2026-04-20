@@ -10,7 +10,7 @@ This project is an LLM-maintained wiki — a structured, interlinked collection 
 - \`.agents/skills/\` — Canonical skill files for operating the wiki
 - \`.claude/skills/\` — Symlink to \`.agents/skills/\` for Claude compatibility
 - \`log.md\` — Append-only edit log
-- \`db9-wiki.toml\` — Configuration (do not modify manually)
+- \`wiki9.toml\` — Configuration (do not modify manually)
 
 ## Page Format
 
@@ -52,10 +52,10 @@ Use Obsidian-style wiki links: \`[[FileName]]\` or \`[[path/to/file|Display Name
 
 ## Workflow
 
-1. After modifying any wiki pages or sources, run \`db9-wiki sync\` to update the search index
-2. To find relevant pages, run \`db9-wiki search "query"\`
-3. To see all pages, run \`db9-wiki index\`
-4. To check wiki health, run \`db9-wiki status\`
+1. After modifying any wiki pages or sources, run \`wiki9 sync\` to update the search index
+2. To find relevant pages, run \`wiki9 search "query"\`
+3. To see all pages, run \`wiki9 index\`
+4. To check wiki health, run \`wiki9 status\`
 
 ## Initial Setup
 

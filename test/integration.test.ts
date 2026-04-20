@@ -22,30 +22,30 @@ function run(cmd: string, cwd?: string): string {
   }).trim();
 }
 
-describe("db9-wiki integration", () => {
+describe("wiki9 integration", () => {
   beforeAll(async () => {
-    testDir = await mkdtemp(join(tmpdir(), "db9-wiki-test-"));
+    testDir = await mkdtemp(join(tmpdir(), "wiki9-test-"));
     db9Client = createDb9Client();
 
-    dbId = process.env.DB9_WIKI_TEST_DB_ID ?? "";
+    dbId = process.env.WIKI9_TEST_DB_ID ?? "";
     if (!dbId) {
       try {
         const database = await db9Client.databases.create({
-          name: `db9-wiki-test-${Date.now()}`,
+          name: `wiki9-test-${Date.now()}`,
         });
         dbId = database.id;
         createdDatabase = true;
       } catch (err) {
         throw new Error(
-          `Failed to create a temporary DB9 database. If your account is at the database limit, set DB9_WIKI_TEST_DB_ID to a disposable existing database. Original error: ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to create a temporary DB9 database. If your account is at the database limit, set WIKI9_TEST_DB_ID to a disposable existing database. Original error: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }
 
-    token = process.env.DB9_WIKI_TEST_TOKEN ?? "";
+    token = process.env.WIKI9_TEST_TOKEN ?? "";
     if (!token) {
       const created = await db9Client.tokens.create({
-        name: `db9-wiki-test-${Date.now()}`,
+        name: `wiki9-test-${Date.now()}`,
         expires_in_days: 1,
       });
       token = created.token;
@@ -70,12 +70,12 @@ describe("db9-wiki integration", () => {
     const cliPath = join(process.cwd(), "src/cli.ts");
     const output = run(`npx tsx ${cliPath} init --db ${dbId} --token ${token} --name "Test Wiki"`, testDir);
 
-    expect(output).toContain("Initializing db9-wiki");
+    expect(output).toContain("Initializing wiki9");
     expect(output).toContain("Done!");
 
     const files = await readdir(testDir);
     expect(files).toContain("AGENTS.md");
-    expect(files).toContain("db9-wiki.toml");
+    expect(files).toContain("wiki9.toml");
     expect(files).toContain("log.md");
     expect(files).toContain(".gitignore");
     expect(files).toContain(".agents");
@@ -93,7 +93,7 @@ describe("db9-wiki integration", () => {
     expect(claudeSkillsStat.isSymbolicLink()).toBe(true);
     expect(await readlink(claudeSkillsPath)).toBe("../.agents/skills");
 
-    const config = await readFile(join(testDir, "db9-wiki.toml"), "utf-8");
+    const config = await readFile(join(testDir, "wiki9.toml"), "utf-8");
     expect(config).toContain(dbId);
     expect(config).toContain('name = "Test Wiki"');
 
@@ -113,12 +113,12 @@ describe("db9-wiki integration", () => {
     expect(ingestSkill).toContain("write those rules into `AGENTS.md` before ingesting content");
 
     const gitignore = await readFile(join(testDir, ".gitignore"), "utf-8");
-    expect(gitignore).toContain("db9-wiki.toml");
-    expect(gitignore).toContain(".db9-wiki/");
+    expect(gitignore).toContain("wiki9.toml");
+    expect(gitignore).toContain(".wiki9/");
   });
 
   it("init pulls existing remote wiki data", async () => {
-    const remoteDir = await mkdtemp(join(tmpdir(), "db9-wiki-remote-init-"));
+    const remoteDir = await mkdtemp(join(tmpdir(), "wiki9-remote-init-"));
 
     await db9Client.fs.mkdir(dbId, "/wiki/remote");
     await db9Client.fs.mkdir(dbId, "/sources/2026-04-07");
@@ -234,7 +234,7 @@ Promises represent eventual completion of async operations.
     expect(output).toContain("fs9 sync complete (0 written, 0 skipped, 0 removed)");
     expect(output).toContain("wiki:    0 created, 0 updated, 0 deleted, 2 unchanged");
 
-    const state = JSON.parse(await readFile(join(testDir, ".db9-wiki", "sync-state.json"), "utf-8"));
+    const state = JSON.parse(await readFile(join(testDir, ".wiki9", "sync-state.json"), "utf-8"));
     expect(state.lastSuccessfulSyncAt).toBeTypeOf("string");
   });
 
@@ -427,7 +427,7 @@ Imported later, but timestamp preserved.
   it("sync handles dollar-prefixed page content safely", async () => {
     const cliPath = join(process.cwd(), "src/cli.ts");
     try {
-      await readFile(join(testDir, "db9-wiki.toml"), "utf-8");
+      await readFile(join(testDir, "wiki9.toml"), "utf-8");
     } catch {
       run(`npx tsx ${cliPath} init --db ${dbId} --token ${token} --name "Test Wiki"`, testDir);
     }

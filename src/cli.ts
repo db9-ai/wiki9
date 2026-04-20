@@ -8,7 +8,7 @@ import { statusCommand } from "./commands/status.js";
 const program = new Command();
 
 program
-  .name("db9-wiki")
+  .name("wiki9")
   .description("Agent-native LLM Wiki powered by DB9")
   .version("0.1.2");
 

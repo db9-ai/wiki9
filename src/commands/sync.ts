@@ -13,7 +13,7 @@ import {
   type WikiPageEntry,
 } from "../utils/wiki.js";
 
-const SYNC_STATE_DIR = ".db9-wiki";
+const SYNC_STATE_DIR = ".wiki9";
 const SYNC_STATE_FILE = "sync-state.json";
 const SYNC_STATE_VERSION = 1;
 
@@ -490,7 +490,7 @@ async function performLightweightSync(
 ): Promise<{ created: number; updated: number; deleted: number; unchanged: number; fs9Succeeded: boolean; referencedSourcePaths: Set<string>; pageSourceRows: PageSourceRow[]; hasLogFile: boolean }> {
   const lastSyncMs = Date.parse(state.lastSuccessfulSyncAt);
   if (Number.isNaN(lastSyncMs)) {
-    throw new Error("Stored sync state has an invalid timestamp. Re-run with `db9-wiki sync --full` once to reset it.");
+    throw new Error("Stored sync state has an invalid timestamp. Re-run with `wiki9 sync --full` once to reset it.");
   }
 
   const currentWikiPaths = new Set(wikiEntries.map((entry) => entry.path));

@@ -1,8 +1,8 @@
-# db9-wiki
+# wiki9
 
 基于 [DB9](https://db9.ai) 的 Agent 原生 LLM Wiki。灵感来自 [Karpathy 的 LLM Wiki 模式](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)。
 
-不做传统 RAG，而是让 LLM 增量构建和维护一个持久化的 wiki —— 一组结构化、互相链接的 markdown 文件。db9-wiki 本身不调用 LLM，而是生成 `AGENTS.md` + skill 文件，让任意 AI agent（Claude Code、Cursor、Windsurf 等）直接操作 wiki。
+不做传统 RAG，而是让 LLM 增量构建和维护一个持久化的 wiki —— 一组结构化、互相链接的 markdown 文件。wiki9 本身不调用 LLM，而是生成 `AGENTS.md` + skill 文件，让任意 AI agent（Claude Code、Cursor、Windsurf 等）直接操作 wiki。
 
 ## 为什么使用 DB9
 
@@ -20,7 +20,7 @@
     ├── sources/    ← 原始来源
     └── log.md      ← 编辑记录
          │
-         │  db9-wiki sync
+         │  wiki9 sync
          ▼
     DB9 数据库
     ├── wiki_index   ← 向量搜索索引
@@ -37,8 +37,8 @@
 # 安装 DB9 CLI
 curl -fsSL https://db9.ai/install | sh
 
-# 安装 db9-wiki
-npm install -g db9-wiki
+# 安装 wiki9
+npm install -g wiki9
 ```
 
 ```bash
@@ -53,7 +53,7 @@ db9 token create --name wiki-agent --expires-in-days 36500
 
 # 初始化 wiki
 cd my-knowledge-base
-db9-wiki init --db <database-id> --token <api-token>
+wiki9 init --db <database-id> --token <api-token>
 ```
 
 生成的目录结构：
@@ -68,7 +68,7 @@ my-knowledge-base/
 │       └── lint.md    # 检查：wiki 健康检查
 ├── .claude/
 │   └── skills -> ../.agents/skills
-├── db9-wiki.toml      # 配置（含 DB9 凭证，自动加入 .gitignore）
+├── wiki9.toml         # 配置（含 DB9 凭证，自动加入 .gitignore）
 ├── log.md             # 编辑记录（append-only）
 ├── wiki/              # Wiki 页面（markdown）
 └── sources/           # 原始来源文件
@@ -79,22 +79,22 @@ my-knowledge-base/
 ## CLI 命令
 
 ```bash
-db9-wiki init --db <id> --token <token>   # 初始化项目 + DB9 schema
-db9-wiki sync                              # 同步本地文件 → DB9（向量索引 + fs9 备份）
-db9-wiki search "查询内容"                  # 语义搜索 wiki 页面
-db9-wiki index                             # 列出所有页面（slug、标题、描述、标签）
-db9-wiki status                            # Wiki 统计信息
+wiki9 init --db <id> --token <token>   # 初始化项目 + DB9 schema
+wiki9 sync                              # 同步本地文件 → DB9（向量索引 + fs9 备份）
+wiki9 search "查询内容"                  # 语义搜索 wiki 页面
+wiki9 index                             # 列出所有页面（slug、标题、描述、标签）
+wiki9 status                            # Wiki 统计信息
 ```
 
 ## Skill 说明
 
 ### ingest（摄入）
 
-将新的来源材料处理成 wiki 页面。Agent 读取来源内容，复制到 `sources/YYYY-MM-DD/`，尽量保留原始文件名或目录名，重名时自动重命名，在 `wiki/` 中创建或更新页面，维护 Obsidian 风格的交叉引用，最后运行 `db9-wiki sync`。
+将新的来源材料处理成 wiki 页面。Agent 读取来源内容，复制到 `sources/YYYY-MM-DD/`，尽量保留原始文件名或目录名，重名时自动重命名，在 `wiki/` 中创建或更新页面，维护 Obsidian 风格的交叉引用，最后运行 `wiki9 sync`。
 
 ### query（查询）
 
-基于 wiki 内容回答问题。Agent 先用 `db9-wiki search` 找到相关页面，读取后合成回答。有价值的回答会被写回 wiki 作为新页面，让每次探索都能积累知识。
+基于 wiki 内容回答问题。Agent 先用 `wiki9 search` 找到相关页面，读取后合成回答。有价值的回答会被写回 wiki 作为新页面，让每次探索都能积累知识。
 
 ### lint（检查）
 
@@ -138,7 +138,7 @@ updated: 2026-04-07
 
 ## Sync 工作原理
 
-`db9-wiki sync` 对比本地文件和 DB9 记录：
+`wiki9 sync` 对比本地文件和 DB9 记录：
 
 1. 扫描 `wiki/`、`sources/` 和 `log.md`
 2. 计算内容哈希，与 DB9 记录对比
@@ -156,7 +156,7 @@ npm run typecheck             # 类型检查
 npx vitest run                # 运行集成测试（默认实时创建临时 DB9 实例）
 ```
 
-如果账号已达到 DB9 数据库数量上限，可以设置 `DB9_WIKI_TEST_DB_ID` 指向一个专门用于测试、可安全复用的数据库；也可以设置 `DB9_WIKI_TEST_TOKEN` 显式提供测试 token。
+如果账号已达到 DB9 数据库数量上限，可以设置 `WIKI9_TEST_DB_ID` 指向一个专门用于测试、可安全复用的数据库；也可以设置 `WIKI9_TEST_TOKEN` 显式提供测试 token。
 
 ## License
 

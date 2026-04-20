@@ -8,7 +8,7 @@ export interface WikiConfig {
   search: { top_k: number };
 }
 
-const CONFIG_FILE = "db9-wiki.toml";
+const CONFIG_FILE = "wiki9.toml";
 
 export async function loadConfig(dir: string = process.cwd()): Promise<WikiConfig> {
   const path = join(dir, CONFIG_FILE);

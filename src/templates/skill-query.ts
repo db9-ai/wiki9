@@ -9,7 +9,7 @@ Search the wiki and synthesize answers.
 ## Steps
 
 1. Use hybrid search to find relevant pages:
-   - Run \`db9-wiki search "<user's question>"\` for semantic (vector) search
+   - Run \`wiki9 search "<user's question>"\` for semantic (vector) search
    - Run \`grep -rl "<keyword>" wiki/\` for exact keyword matching in local files
    - Combine results from both — semantic search catches related concepts, grep catches exact terms
 2. Read the returned markdown files from \`wiki/\`
@@ -25,13 +25,13 @@ Search the wiki and synthesize answers.
      ## [YYYY-MM-DD] query | Question Summary
      - created \\\`slug\\\` — captured query synthesis
      \`\`\`
-   - Run \`db9-wiki sync\`
+   - Run \`wiki9 sync\`
 
 ## Guidelines
 
 - Always ground answers in wiki content — don't fabricate
 - If the wiki lacks information to answer, say so clearly
-- Use both search methods: \`db9-wiki search\` for fuzzy/semantic matches, \`grep\` for precise keyword hits
+- Use both search methods: \`wiki9 search\` for fuzzy/semantic matches, \`grep\` for precise keyword hits
 - Valuable queries that produce new insights should be written back as pages
 - This lets explorations compound over time
 `;

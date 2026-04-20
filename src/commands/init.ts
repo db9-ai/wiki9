@@ -97,7 +97,7 @@ export async function initCommand(db: string, token: string, name: string) {
   const dir = process.cwd();
   const wikiName = name || "My Knowledge Base";
 
-  console.log(`Initializing db9-wiki in ${dir}...\n`);
+  console.log(`Initializing wiki9 in ${dir}...\n`);
 
   // Create directories
   for (const sub of ["wiki", "sources", ".agents/skills", ".claude"]) {
@@ -107,11 +107,11 @@ export async function initCommand(db: string, token: string, name: string) {
 
   // Write config
   const configContent = `[wiki]\nname = "${wikiName}"\n\n[db9]\ndatabase = "${db}"\ntoken = "${token}"\n\n[search]\ntop_k = 5\n`;
-  await writeIfMissing(join(dir, "db9-wiki.toml"), configContent);
+  await writeIfMissing(join(dir, "wiki9.toml"), configContent);
 
   // Write .gitignore entry for config (contains credentials)
   const gitignorePath = join(dir, ".gitignore");
-  const ignoreEntries = ["db9-wiki.toml", ".db9-wiki/"];
+  const ignoreEntries = ["wiki9.toml", ".wiki9/"];
   try {
     const { readFile } = await import("node:fs/promises");
     const existing = await readFile(gitignorePath, "utf-8");
@@ -153,7 +153,7 @@ export async function initCommand(db: string, token: string, name: string) {
     console.log(`  pulled ${pulledWiki} wiki files, ${pulledSources} source files${pulledLog ? ", 1 log file" : ""}`);
   } catch (err) {
     console.error(`  DB9 schema init failed: ${err instanceof Error ? err.message : err}`);
-    console.error(`  You can retry later with: db9-wiki sync`);
+    console.error(`  You can retry later with: wiki9 sync`);
   }
 
   // Write log.md

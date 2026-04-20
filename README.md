@@ -1,8 +1,8 @@
-# db9-wiki
+# wiki9
 
 Agent-native LLM Wiki powered by [DB9](https://db9.ai). Based on [Karpathy's LLM Wiki pattern](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f). The readme is also available in [中文](./README.zh-CN.md).
 
-Instead of traditional RAG, the LLM incrementally builds and maintains a persistent wiki — a structured, interlinked collection of markdown files. Instead of embedding LLM calls in the tool itself, db9-wiki generates `AGENTS.md` + skill files so any AI agent (Claude Code, Cursor, Windsurf, etc.) can operate the wiki directly.
+Instead of traditional RAG, the LLM incrementally builds and maintains a persistent wiki — a structured, interlinked collection of markdown files. Instead of embedding LLM calls in the tool itself, wiki9 generates `AGENTS.md` + skill files so any AI agent (Claude Code, Cursor, Windsurf, etc.) can operate the wiki directly.
 
 ## Why DB9
 
@@ -20,7 +20,7 @@ User ↔ AI Agent (Claude Code / Cursor / ...)
     ├── sources/    ← raw source materials
     └── log.md      ← edit history
          │
-         │  db9-wiki sync
+         │  wiki9 sync
          ▼
     DB9 Database
     ├── wiki_index   ← vector search index
@@ -37,8 +37,8 @@ Install DB9 first. The official site is [db9.ai](https://db9.ai).
 # Install the DB9 CLI
 curl -fsSL https://db9.ai/install | sh
 
-# Install db9-wiki
-npm install -g db9-wiki
+# Install wiki9
+npm install -g wiki9
 ```
 
 ```bash
@@ -54,7 +54,7 @@ db9 token create --name wiki-agent --expires-in-days 36500
 
 # Initialize the wiki
 cd my-knowledge-base
-db9-wiki init --db <database-id> --token <api-token>
+wiki9 init --db <database-id> --token <api-token>
 ```
 
 This generates:
@@ -69,7 +69,7 @@ my-knowledge-base/
 │       └── lint.md    # Lint skill: health-check the wiki
 ├── .claude/
 │   └── skills -> ../.agents/skills
-├── db9-wiki.toml      # Config (DB9 credentials — auto-added to .gitignore)
+├── wiki9.toml         # Config (DB9 credentials — auto-added to .gitignore)
 ├── log.md             # Append-only edit log
 ├── wiki/              # Wiki pages (markdown)
 └── sources/           # Raw source materials
@@ -80,22 +80,22 @@ Now open the project with your AI agent and start using the skills. For example,
 ## CLI Commands
 
 ```bash
-db9-wiki init --db <id> --token <token>   # Initialize project + DB9 schema
-db9-wiki sync                              # Sync local files → DB9 (vector index + fs9 backup)
-db9-wiki search "query"                    # Semantic search across wiki pages
-db9-wiki index                             # List all pages (slug, title, description, tags)
-db9-wiki status                            # Wiki stats
+wiki9 init --db <id> --token <token>   # Initialize project + DB9 schema
+wiki9 sync                              # Sync local files → DB9 (vector index + fs9 backup)
+wiki9 search "query"                    # Semantic search across wiki pages
+wiki9 index                             # List all pages (slug, title, description, tags)
+wiki9 status                            # Wiki stats
 ```
 
 ## Skills
 
 ### ingest
 
-Process new source material into wiki pages. The agent reads the source, copies it into `sources/YYYY-MM-DD/`, preserves the original file or directory name when possible, renames on conflicts, creates/updates wiki pages in `wiki/`, maintains Obsidian-style cross-references, and runs `db9-wiki sync`.
+Process new source material into wiki pages. The agent reads the source, copies it into `sources/YYYY-MM-DD/`, preserves the original file or directory name when possible, renames on conflicts, creates/updates wiki pages in `wiki/`, maintains Obsidian-style cross-references, and runs `wiki9 sync`.
 
 ### query
 
-Answer questions from the wiki. The agent runs `db9-wiki search` to find relevant pages, reads them, and synthesizes an answer. Valuable answers get written back as new wiki pages so explorations compound over time.
+Answer questions from the wiki. The agent runs `wiki9 search` to find relevant pages, reads them, and synthesizes an answer. Valuable answers get written back as new wiki pages so explorations compound over time.
 
 ### lint
 
@@ -139,7 +139,7 @@ Every operation is recorded in `log.md`:
 
 ## How Sync Works
 
-`db9-wiki sync` diffs local files against DB9:
+`wiki9 sync` diffs local files against DB9:
 
 1. Scans `wiki/`, `sources/`, and `log.md`
 2. Computes content hashes, compares with DB9 records
@@ -157,7 +157,7 @@ npm run typecheck             # Type check
 npx vitest run                # Run integration tests (creates a temporary DB9 database by default)
 ```
 
-If your account is already at the DB9 database limit, set `DB9_WIKI_TEST_DB_ID` to a disposable database reserved for tests. You can also set `DB9_WIKI_TEST_TOKEN` to provide an explicit test token.
+If your account is already at the DB9 database limit, set `WIKI9_TEST_DB_ID` to a disposable database reserved for tests. You can also set `WIKI9_TEST_TOKEN` to provide an explicit test token.
 
 ## License
 
