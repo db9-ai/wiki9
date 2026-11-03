@@ -1,5 +1,8 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, open, rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { contentHash } from "../utils/hash.js";
+import { ensureSafeDirectory, isNotFound, isRelativeFilePath, readSafeFile, remoteChildPath } from "../utils/paths.js";
 import { loadConfig } from "../config.js";
 import { createClient, execSql, initSchema } from "../db.js";
 import { escapeSqlLiteral, escapeSqlString } from "../utils/sql.js";
@@ -15,10 +18,11 @@ import {
 
 const SYNC_STATE_DIR = ".wiki9";
 const SYNC_STATE_FILE = "sync-state.json";
-const SYNC_STATE_VERSION = 1;
+const SYNC_STATE_VERSION = 2;
 
 interface SyncOptions {
   full?: boolean;
+  prune?: boolean;
 }
 
 interface SyncableFile {
@@ -35,10 +39,12 @@ interface PageSourceRow {
 
 interface SyncState {
   version: number;
+  database: string;
   lastSuccessfulSyncAt: string;
   wikiPaths: string[];
   sourcePaths: string[];
   hasLogFile: boolean;
+  remoteSnapshot: string;
 }
 
 function isEntryChanged(
@@ -66,28 +72,37 @@ function syncStatePath(dir: string): string {
   return join(dir, SYNC_STATE_DIR, SYNC_STATE_FILE);
 }
 
-async function loadSyncState(dir: string): Promise<SyncState | null> {
+async function loadSyncState(dir: string, dbId: string): Promise<SyncState | null> {
   try {
-    const raw = await readFile(syncStatePath(dir), "utf-8");
+    const raw = (await readSafeFile(dir, syncStatePath(dir))).toString("utf-8");
     const parsed = JSON.parse(raw) as Partial<SyncState>;
     if (
-      parsed.version !== SYNC_STATE_VERSION
+      !parsed || parsed.version !== SYNC_STATE_VERSION
+      || parsed.database !== dbId
       || typeof parsed.lastSuccessfulSyncAt !== "string"
+      || !Number.isFinite(Date.parse(parsed.lastSuccessfulSyncAt))
+      || Date.parse(parsed.lastSuccessfulSyncAt) > Date.now()
       || !Array.isArray(parsed.wikiPaths)
+      || !parsed.wikiPaths.every((value) => isRelativeFilePath(value) && value.endsWith(".md"))
       || !Array.isArray(parsed.sourcePaths)
+      || !parsed.sourcePaths.every(isRelativeFilePath)
       || typeof parsed.hasLogFile !== "boolean"
+      || typeof parsed.remoteSnapshot !== "string"
     ) {
       return null;
     }
     return {
       version: SYNC_STATE_VERSION,
+      database: dbId,
       lastSuccessfulSyncAt: parsed.lastSuccessfulSyncAt,
-      wikiPaths: parsed.wikiPaths.filter((value): value is string => typeof value === "string"),
-      sourcePaths: parsed.sourcePaths.filter((value): value is string => typeof value === "string"),
+      wikiPaths: [...new Set(parsed.wikiPaths)],
+      sourcePaths: [...new Set(parsed.sourcePaths)],
       hasLogFile: parsed.hasLogFile,
+      remoteSnapshot: parsed.remoteSnapshot,
     };
-  } catch {
-    return null;
+  } catch (error) {
+    if (isNotFound(error) || error instanceof SyntaxError) return null;
+    throw error;
   }
 }
 
@@ -96,17 +111,29 @@ async function saveSyncState(
   wikiEntries: WikiPageEntry[],
   sourceEntries: SourceFileEntry[],
   hasLogFile: boolean,
+  dbId: string,
+  startedAt: string,
+  remoteSnapshot: string,
 ): Promise<void> {
   const stateDir = join(dir, SYNC_STATE_DIR);
-  await mkdir(stateDir, { recursive: true });
+  await ensureSafeDirectory(dir, stateDir, true);
   const state: SyncState = {
     version: SYNC_STATE_VERSION,
-    lastSuccessfulSyncAt: new Date().toISOString(),
+    database: dbId,
+    lastSuccessfulSyncAt: startedAt,
     wikiPaths: wikiEntries.map((entry) => entry.path).sort(),
     sourcePaths: sourceEntries.map((entry) => entry.path).sort(),
     hasLogFile,
+    remoteSnapshot,
   };
-  await writeFile(syncStatePath(dir), `${JSON.stringify(state, null, 2)}\n`, "utf-8");
+  const temporaryPath = join(stateDir, `sync-state-${randomUUID()}.tmp`);
+  const file = await open(temporaryPath, "wx", 0o600);
+  try {
+    await file.writeFile(`${JSON.stringify(state, null, 2)}\n`);
+  } finally {
+    await file.close();
+  }
+  await rename(temporaryPath, syncStatePath(dir));
 }
 
 function shouldWriteRemote(
@@ -154,32 +181,102 @@ function chunkRows<T>(rows: T[], chunkSize: number): T[][] {
   return chunks;
 }
 
-function toRemotePath(basePath: string, childPath: string): string {
-  if (childPath.startsWith("/")) return childPath;
-  return `${basePath.replace(/\/$/, "")}/${childPath.replace(/^\//, "")}`;
-}
-
 async function walkRemoteFiles(
-  fsClient: { readdir(path: string): Promise<Array<{ path: string; type: string }>> },
+  fsClient: { readdir(path: string): Promise<Array<{ path: string; type: string; size: number; mtime: string }>> },
   remotePath: string,
-): Promise<string[]> {
-  let entries: Array<{ path: string; type: string }>;
+): Promise<Array<{ path: string; size: number; mtime: string }>> {
+  let entries: Array<{ path: string; type: string; size: number; mtime: string }>;
   try {
     entries = await fsClient.readdir(remotePath);
-  } catch {
-    return [];
+  } catch (error) {
+    if (isNotFound(error)) return [];
+    throw error;
   }
 
-  const files: string[] = [];
+  const files: Array<{ path: string; size: number; mtime: string }> = [];
   for (const entry of entries) {
-    const childPath = toRemotePath(remotePath, entry.path);
+    const childPath = remoteChildPath(remotePath, entry.path);
     if (entry.type === "dir") {
       files.push(...(await walkRemoteFiles(fsClient, childPath)));
       continue;
     }
-    files.push(childPath);
+    if (entry.type !== "file") throw new Error("Cannot sync a remote special file");
+    files.push({ path: childPath, size: entry.size, mtime: entry.mtime });
   }
   return files;
+}
+
+async function localLogExists(dir: string): Promise<boolean> {
+  try {
+    await readSafeFile(dir, join(dir, "log.md"));
+    return true;
+  } catch (error) {
+    if (isNotFound(error)) return false;
+    throw error;
+  }
+}
+
+async function inspectRemote(client: ReturnType<typeof createClient>, dbId: string) {
+  const index = await execSql(client, dbId, "SELECT slug, content_hash FROM wiki_index ORDER BY slug");
+  const references = await execSql(client, dbId,
+    "SELECT page_slug, source_path FROM wiki_page_sources ORDER BY page_slug, source_path");
+  const fsClient = await client.fs.connect(dbId);
+  try {
+    const files = [
+      ...(await walkRemoteFiles(fsClient, "/wiki")),
+      ...(await walkRemoteFiles(fsClient, "/sources")),
+    ];
+    try {
+      const log = await fsClient.stat("/log.md");
+      files.push({ path: "/log.md", size: log.size, mtime: log.mtime });
+    } catch (error) {
+      if (!isNotFound(error)) throw error;
+    }
+    files.sort((a, b) => a.path.localeCompare(b.path));
+    return {
+      indexRows: index.rows,
+      referenceRows: references.rows,
+      paths: files.map((file) => file.path),
+      snapshot: contentHash(JSON.stringify([index.rows, references.rows, files])),
+    };
+  } finally {
+    await fsClient.close();
+  }
+}
+
+function requirePruneApproval(
+  remote: Awaited<ReturnType<typeof inspectRemote>>,
+  state: SyncState | null, wikiEntries: WikiPageEntry[], sourceEntries: SourceFileEntry[],
+  hasLogFile: boolean, prune: boolean,
+): string[] {
+  const localSlugs = new Set(wikiEntries.map((entry) => entry.slug));
+  const previousSlugs = new Set(state?.wikiPaths.map((path) => path.replace(/\.md$/, "")));
+  const localPaths = new Set([
+    ...wikiEntries.map((entry) => `/wiki/${entry.path}`),
+    ...sourceEntries.map((entry) => `/sources/${entry.path}`),
+    ...(hasLogFile ? ["/log.md"] : []),
+  ]);
+  const previousPaths = new Set([
+    ...(state?.wikiPaths.map((path) => `/wiki/${path}`) ?? []),
+    ...(state?.sourcePaths.map((path) => `/sources/${path}`) ?? []),
+    ...(state?.hasLogFile ? ["/log.md"] : []),
+  ]);
+  const stalePaths = remote.paths.filter((path) => !localPaths.has(path));
+  const unknown = [
+    ...stalePaths.filter((path) => !previousPaths.has(path)),
+    ...remote.indexRows.filter(([slug]) => !localSlugs.has(slug as string) && !previousSlugs.has(slug as string))
+      .map(([slug]) => `index: ${slug}`),
+    ...remote.referenceRows.filter(([slug]) => !localSlugs.has(slug as string) && !previousSlugs.has(slug as string))
+      .map(([slug, source]) => `reference: ${slug} -> ${source}`),
+  ];
+  if (unknown.length > 0) {
+    console.log(`Remote-only data outside the saved sync state (${unknown.length} entries):`);
+    for (const path of unknown) console.log(`  ${path}`);
+    if (!prune) {
+      throw new Error("Remote data was not changed. Restore missing files with `wiki9 init`, or review the list and explicitly run `wiki9 sync --full --prune`.");
+    }
+  }
+  return stalePaths;
 }
 
 async function syncPageSourceReferencesFull(
@@ -204,20 +301,7 @@ async function syncPageSourceReferencesFull(
   }
 
   console.log("  page-source links changed; rebuilding...");
-  await execSql(client, dbId, "DELETE FROM wiki_page_sources");
-  if (pageSourceRows.length === 0) {
-    console.log("  page-source links: 0/0");
-    return;
-  }
-
-  const chunks = chunkRows(pageSourceRows, 200);
-  for (const [index, chunk] of chunks.entries()) {
-    await execSql(client, dbId, `
-      INSERT INTO wiki_page_sources (page_slug, source_path)
-      VALUES ${buildPageSourceValues(chunk)}
-    `);
-    logProgress("page-source links", Math.min((index + 1) * 200, pageSourceRows.length), pageSourceRows.length);
-  }
+  await reconcilePageSourceReferences(client, dbId, pageSourceRows, existingRows);
 }
 
 async function syncPageSourceReferencesLightweight(
@@ -248,20 +332,29 @@ async function syncPageSourceReferencesLightweight(
   }
 
   console.log("  page-source links changed; updating affected pages...");
-  await execSql(client, dbId, `DELETE FROM wiki_page_sources WHERE page_slug IN (${escapeSqlList(affectedSlugs)})`);
-  if (pageSourceRows.length === 0) {
-    console.log("  page-source links: 0/0");
-    return;
-  }
+  await reconcilePageSourceReferences(client, dbId, pageSourceRows, existingRows);
+}
 
-  const chunks = chunkRows(pageSourceRows, 200);
-  for (const [index, chunk] of chunks.entries()) {
+async function reconcilePageSourceReferences(
+  client: ReturnType<typeof createClient>, dbId: string,
+  desired: PageSourceRow[], existing: PageSourceRow[],
+): Promise<void> {
+  const desiredByKey = new Map(desired.map((row) => [pageSourceKey(row), row]));
+  const existingKeys = new Set(existing.map(pageSourceKey));
+  const additions = [...desiredByKey.values()].filter((row) => !existingKeys.has(pageSourceKey(row)));
+  // Install all new links before removing obsolete ones, so failed inserts retain old links.
+  for (const chunk of chunkRows(additions, 200)) {
     await execSql(client, dbId, `
       INSERT INTO wiki_page_sources (page_slug, source_path)
-      VALUES ${buildPageSourceValues(chunk)}
+      VALUES ${buildPageSourceValues(chunk)} ON CONFLICT DO NOTHING
     `);
-    logProgress("page-source links", Math.min((index + 1) * 200, pageSourceRows.length), pageSourceRows.length);
   }
+  for (const chunk of chunkRows(existing.filter((row) => !desiredByKey.has(pageSourceKey(row))), 200)) {
+    const predicates = chunk.map((row) =>
+      `(page_slug = '${escapeStr(row.pageSlug)}' AND source_path = '${escapeStr(row.sourcePath)}')`);
+    await execSql(client, dbId, `DELETE FROM wiki_page_sources WHERE ${predicates.join(" OR ")}`);
+  }
+  logProgress("page-source links", desiredByKey.size, desiredByKey.size);
 }
 
 async function syncFs9Files(
@@ -285,8 +378,8 @@ async function syncFs9Files(
       let remote: { type: string; size: number; mtime: string } | null = null;
       try {
         remote = await statFile(file.path);
-      } catch {
-        remote = null;
+      } catch (error) {
+        if (!isNotFound(error)) throw error;
       }
       shouldWrite = shouldWriteRemote(remote, file);
     }
@@ -341,8 +434,8 @@ async function buildLogSyncFile(
   const logPath = join(dir, "log.md");
   try {
     const [logContent, logStats] = await Promise.all([
-      readFile(logPath, "utf-8"),
-      stat(logPath),
+      readSafeFile(dir, logPath).then((bytes) => bytes.toString("utf-8")),
+      lstat(logPath),
     ]);
     return {
       path: "/log.md",
@@ -350,8 +443,9 @@ async function buildLogSyncFile(
       mtimeMs: logStats.mtimeMs,
       write: () => writer("/log.md", logContent),
     };
-  } catch {
-    return null;
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    throw error;
   }
 }
 
@@ -361,7 +455,8 @@ async function performFullSync(
   dir: string,
   wikiEntries: WikiPageEntry[],
   sourceEntries: SourceFileEntry[],
-): Promise<{ created: number; updated: number; deleted: number; unchanged: number; fs9Succeeded: boolean; referencedSourcePaths: Set<string>; pageSourceRows: PageSourceRow[]; hasLogFile: boolean }> {
+  staleRemotePaths: string[],
+): Promise<{ created: number; updated: number; deleted: number; unchanged: number; referencedSourcePaths: Set<string>; pageSourceRows: PageSourceRow[]; hasLogFile: boolean }> {
   const wikiFiles = await Promise.all(wikiEntries.map(loadWikiPage));
   const sourceFiles = await Promise.all(sourceEntries.map(loadSourceFile));
 
@@ -427,8 +522,7 @@ async function performFullSync(
   await syncPageSourceReferencesFull(client, dbId, pageSourceRows);
 
   console.log("Syncing to fs9...");
-  let fs9Succeeded = true;
-  const hasLogFile = await stat(join(dir, "log.md")).then(() => true).catch(() => false);
+  const hasLogFile = await localLogExists(dir);
   try {
     const fsClient = await client.fs.connect(dbId);
     try {
@@ -445,20 +539,6 @@ async function performFullSync(
         write: () => fsClient.writeFile(`/sources/${file.path}`, file.bytes),
       }));
       const logSyncFile = await buildLogSyncFile(dir, (path, content) => fsClient.writeFile(path, content));
-      const currentRemotePaths = new Set([
-        ...wikiSyncFiles.map((file) => file.path),
-        ...sourceSyncFiles.map((file) => file.path),
-        ...(logSyncFile ? [logSyncFile.path] : []),
-      ]);
-      const staleRemotePaths = [
-        ...(await walkRemoteFiles(fsClient, "/wiki")).filter((path) => !currentRemotePaths.has(path)),
-        ...(await walkRemoteFiles(fsClient, "/sources")).filter((path) => !currentRemotePaths.has(path)),
-      ];
-      const shouldRemoveLog = !logSyncFile && await fsClient.stat("/log.md").then(() => true).catch(() => false);
-      if (shouldRemoveLog) {
-        staleRemotePaths.push("/log.md");
-      }
-
       const wikiFs9 = await syncFs9Files(wikiSyncFiles, "wiki files", "wiki files", (path) => fsClient.stat(path));
       const sourceFs9 = await syncFs9Files(sourceSyncFiles, "source files", "source files", (path) => fsClient.stat(path));
       const logFs9 = logSyncFile
@@ -473,11 +553,10 @@ async function performFullSync(
       await fsClient.close();
     }
   } catch (err) {
-    fs9Succeeded = false;
-    console.error(`  fs9 sync failed: ${err instanceof Error ? err.message : err}`);
+    throw new Error("File sync failed; local sync state was not advanced. Retry sync after resolving the error.", { cause: err });
   }
 
-  return { created, updated, deleted, unchanged, fs9Succeeded, referencedSourcePaths, pageSourceRows, hasLogFile };
+  return { created, updated, deleted, unchanged, referencedSourcePaths, pageSourceRows, hasLogFile };
 }
 
 async function performLightweightSync(
@@ -487,7 +566,7 @@ async function performLightweightSync(
   state: SyncState,
   wikiEntries: WikiPageEntry[],
   sourceEntries: SourceFileEntry[],
-): Promise<{ created: number; updated: number; deleted: number; unchanged: number; fs9Succeeded: boolean; referencedSourcePaths: Set<string>; pageSourceRows: PageSourceRow[]; hasLogFile: boolean }> {
+): Promise<{ created: number; updated: number; deleted: number; unchanged: number; referencedSourcePaths: Set<string>; pageSourceRows: PageSourceRow[]; hasLogFile: boolean }> {
   const lastSyncMs = Date.parse(state.lastSuccessfulSyncAt);
   if (Number.isNaN(lastSyncMs)) {
     throw new Error("Stored sync state has an invalid timestamp. Re-run with `wiki9 sync --full` once to reset it.");
@@ -578,8 +657,7 @@ async function performLightweightSync(
   await syncPageSourceReferencesLightweight(client, dbId, pageSourceRows, affectedSlugs);
 
   console.log("Syncing to fs9...");
-  let fs9Succeeded = true;
-  const hasLogFile = await stat(join(dir, "log.md")).then(() => true).catch(() => false);
+  const hasLogFile = await localLogExists(dir);
   try {
     const fsClient = await client.fs.connect(dbId);
     try {
@@ -617,52 +695,59 @@ async function performLightweightSync(
       await fsClient.close();
     }
   } catch (err) {
-    fs9Succeeded = false;
-    console.error(`  fs9 sync failed: ${err instanceof Error ? err.message : err}`);
+    throw new Error("File sync failed; local sync state was not advanced. Retry sync after resolving the error.", { cause: err });
   }
 
-  return { created, updated, deleted, unchanged, fs9Succeeded, referencedSourcePaths, pageSourceRows, hasLogFile };
+  return { created, updated, deleted, unchanged, referencedSourcePaths, pageSourceRows, hasLogFile };
 }
 
 export async function syncCommand(options: SyncOptions = {}) {
+  if (options.prune && !options.full) throw new Error("--prune requires --full");
+  const startedAt = new Date().toISOString();
   const config = await loadConfig();
   const client = createClient(config);
   const dbId = config.db9.database;
   const dir = process.cwd();
 
   console.log("Scanning local files...");
-  await initSchema(client, dbId);
+  try {
+    await lstat(join(dir, SYNC_STATE_DIR, "restore-incomplete"));
+    throw new Error("Remote restore is incomplete. Retry `wiki9 init` before syncing.");
+  } catch (error) {
+    if (!isNotFound(error)) throw error;
+  }
 
   const wikiDir = join(dir, "wiki");
   const wikiEntries = await collectWikiPageEntries(wikiDir);
   const sourcesDir = join(dir, "sources");
   const sourceEntries = await collectSourceFileEntries(sourcesDir);
+  const hasLogFile = await localLogExists(dir);
   console.log(`Collected ${wikiEntries.length} wiki pages and ${sourceEntries.length} source files.`);
 
+  const state = await loadSyncState(dir, dbId);
+  await initSchema(client, dbId);
+  const remote = await inspectRemote(client, dbId);
+  if (state && remote.snapshot !== state.remoteSnapshot && !options.prune) {
+    throw new Error("Remote data changed since this directory last synced. Restore and merge changes in a separate directory before syncing, or explicitly review `wiki9 sync --full --prune` to replace remote data.");
+  }
   let result;
   if (options.full) {
+    const stalePaths = requirePruneApproval(remote, state, wikiEntries, sourceEntries, hasLogFile, !!options.prune);
     console.log("Running full sync...");
-    result = await performFullSync(client, dbId, dir, wikiEntries, sourceEntries);
+    result = await performFullSync(client, dbId, dir, wikiEntries, sourceEntries, stalePaths);
   } else {
-    const state = await loadSyncState(dir);
     if (!state) {
-      console.log("No previous successful sync state found; running full sync.");
-      result = await performFullSync(client, dbId, dir, wikiEntries, sourceEntries);
+      const stalePaths = requirePruneApproval(remote, state, wikiEntries, sourceEntries, hasLogFile, false);
+      console.log("No previous successful sync state found; running full sync without implicit remote pruning.");
+      result = await performFullSync(client, dbId, dir, wikiEntries, sourceEntries, stalePaths);
     } else {
       result = await performLightweightSync(client, dbId, dir, state, wikiEntries, sourceEntries);
     }
   }
 
-  if (result.fs9Succeeded) {
-    try {
-      await saveSyncState(dir, wikiEntries, sourceEntries, result.hasLogFile);
-      console.log(`Saved sync state to ${syncStatePath(dir)}.`);
-    } catch (err) {
-      console.error(`Failed to save local sync state: ${err instanceof Error ? err.message : err}`);
-    }
-  } else {
-    console.log("Skipped updating sync state because fs9 sync did not complete successfully.");
-  }
+  const after = await inspectRemote(client, dbId);
+  await saveSyncState(dir, wikiEntries, sourceEntries, result.hasLogFile, dbId, startedAt, after.snapshot);
+  console.log(`Saved sync state to ${syncStatePath(dir)}.`);
 
   console.log("\nSync complete:");
   console.log(`  wiki:    ${result.created} created, ${result.updated} updated, ${result.deleted} deleted, ${result.unchanged} unchanged`);

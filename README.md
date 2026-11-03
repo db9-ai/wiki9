@@ -50,11 +50,11 @@ db9 login
 db9 create --name my-wiki
 
 # Create an API token
-db9 token create --name wiki-agent --expires-in-days 36500
+db9 token create --name wiki-agent --expires-in-days 30
 
 # Initialize the wiki
 cd my-knowledge-base
-wiki9 init --db <database-id> --token <api-token>
+wiki9 init --db <database-id>  # Uses your DB9 login; alternatively set WIKI9_TOKEN
 ```
 
 This generates:
@@ -80,7 +80,7 @@ Now open the project with your AI agent and start using the skills. For example,
 ## CLI Commands
 
 ```bash
-wiki9 init --db <id> --token <token>   # Initialize project + DB9 schema
+wiki9 init --db <id>                     # Initialize with DB9 login or WIKI9_TOKEN
 wiki9 sync                              # Sync local files → DB9 (vector index + fs9 backup)
 wiki9 search "query"                    # Semantic search across wiki pages
 wiki9 index                             # List all pages (slug, title, description, tags)
@@ -147,6 +147,28 @@ Every operation is recorded in `log.md`:
 4. Rebuilds `wiki_page_sources` from each page's `sources` frontmatter
 5. Backs up all files to DB9's fs9 filesystem
 
+### Safe synchronization and sharing
+
+One DB9 instance is one shared knowledge base. Everyone with access to that instance may be able to retrieve its pages and **all original files in `sources/`**, including binary files. Access is controlled by DB9 credentials; wiki9 does not create private per-member spaces or its own role system. Use separate instances when content must be kept separate.
+
+Normal sync still propagates local page, source, and log deletions recorded by the last successful sync. Missing directories, unreadable files, symlinks, and special files abort synchronization instead of being treated as deleted content. Copy the intended files into `wiki/` or `sources/` rather than placing symlinks there. The generated `.claude/skills` link remains supported.
+
+When the saved state is absent, invalid, belongs to another database, or uses an older format, sync performs a full scan. It lists and refuses to delete remote-only content that is outside that state. Restore missing files with `wiki9 init --db <id>` first. To deliberately replace the remote wiki with the complete local copy, review the differences and run:
+
+```bash
+wiki9 sync --full --prune
+```
+
+`--prune` requires `--full`. A normal `--full` rescan preserves the same protection. A failed restore must be retried with `init` before sync can proceed. Init preserves existing local files, so merge conflicting content before syncing.
+
+Sync records the remote index, references, and file metadata. If these change before the next sync, it stops before updating content so a stale directory cannot silently replace another writer's changes. Restore the current remote copy in a separate directory and merge it into the working copy; use the explicit replacement command only after reviewing the merged copy. Coordinate writers: this check is not a distributed lock, and simultaneous syncs are not atomic across SQL and file storage. After a partially failed sync, inspect and reconcile both copies before explicitly replacing remote data. The fs9 mirror follows deletions and is not a versioned backup.
+
+### Credentials
+
+Omit `--token` to use your existing `db9 login`, or provide `WIKI9_TOKEN` through your shell's secret input mechanism or secret manager. Environment tokens override the config for that invocation and are not written by init. An explicit init `--token` takes precedence over the environment. An empty `WIKI9_TOKEN` is rejected; unset it to use configured or login credentials. The existing `--token` option remains available; it stores the token in `wiki9.toml`, so avoid putting literal secrets in shell history or process arguments.
+
+Config files use owner-only permissions (`0600`); existing permissions are tightened when read. Init adds exact ignore rules for `wiki9.toml` and `.wiki9/`. Keep them out of version control, including files already tracked by Git. Running init again for the same database with `--token` replaces the stored token while retaining the wiki name and search settings. Revoke replaced or exposed tokens with `db9 token revoke <token-id>`, and choose an expiry suited to the task rather than an effectively permanent token. An empty configured token uses the SDK's local DB9 login credentials and fails if none are available; it does not bypass authentication.
+
 ## Development
 
 ```bash
@@ -154,7 +176,8 @@ npm install
 npm run dev -- sync           # Run commands in dev mode
 npm run build                 # Build with tsup
 npm run typecheck             # Type check
-npx vitest run                # Run integration tests (creates a temporary DB9 database by default)
+npx vitest run test/safety.test.ts       # Offline regression tests
+npx vitest run test/integration.test.ts  # Live integration tests (temporary DB9 database)
 ```
 
 If your account is already at the DB9 database limit, set `WIKI9_TEST_DB_ID` to a disposable database reserved for tests. You can also set `WIKI9_TEST_TOKEN` to provide an explicit test token.

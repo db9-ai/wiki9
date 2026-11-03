@@ -12,20 +12,21 @@ let tokenId: string;
 let db9Client: ReturnType<typeof createDb9Client>;
 let createdDatabase = false;
 let createdToken = false;
+const tsxCommand = `"${process.execPath}" "${join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs")}"`;
 
 function run(cmd: string, cwd?: string): string {
-  return execSync(cmd, {
+  return execSync(cmd.replace("npx tsx", tsxCommand), {
     cwd: cwd ?? testDir,
     encoding: "utf-8",
     timeout: 60_000,
-    env: { ...process.env, NODE_NO_WARNINGS: "1" },
+    env: { ...process.env, WIKI9_TOKEN: token, NODE_NO_WARNINGS: "1" },
   }).trim();
 }
 
 describe("wiki9 integration", () => {
   beforeAll(async () => {
     testDir = await mkdtemp(join(tmpdir(), "wiki9-test-"));
-    db9Client = createDb9Client();
+    db9Client = createDb9Client({ token: process.env.WIKI9_TEST_TOKEN });
 
     dbId = process.env.WIKI9_TEST_DB_ID ?? "";
     if (!dbId) {
@@ -68,7 +69,7 @@ describe("wiki9 integration", () => {
 
   it("init creates project structure", async () => {
     const cliPath = join(process.cwd(), "src/cli.ts");
-    const output = run(`npx tsx ${cliPath} init --db ${dbId} --token ${token} --name "Test Wiki"`, testDir);
+    const output = run(`npx tsx ${cliPath} init --db ${dbId} --name "Test Wiki"`, testDir);
 
     expect(output).toContain("Initializing wiki9");
     expect(output).toContain("Done!");
@@ -142,7 +143,7 @@ Pulled from remote.
     await db9Client.fs.write(dbId, "/log.md", "## [2026-04-07] seed | Remote init\n");
 
     const cliPath = join(process.cwd(), "src/cli.ts");
-    const output = run(`npx tsx ${cliPath} init --db ${dbId} --token ${token} --name "Remote Wiki"`, remoteDir);
+    const output = run(`npx tsx ${cliPath} init --db ${dbId} --name "Remote Wiki"`, remoteDir);
 
     expect(output).toContain("Pulling remote wiki data...");
     expect(output).toContain("pulled");
@@ -206,7 +207,8 @@ Promises represent eventual completion of async operations.
     );
 
     const cliPath = join(process.cwd(), "src/cli.ts");
-    const output = run(`npx tsx ${cliPath} sync`, testDir);
+    // Explicitly discard remote-only fixtures left by the restore test.
+    const output = run(`npx tsx ${cliPath} sync --full --prune`, testDir);
 
     expect(output).toContain("Sync complete");
     expect(output).toContain("2 created");
@@ -429,7 +431,7 @@ Imported later, but timestamp preserved.
     try {
       await readFile(join(testDir, "wiki9.toml"), "utf-8");
     } catch {
-      run(`npx tsx ${cliPath} init --db ${dbId} --token ${token} --name "Test Wiki"`, testDir);
+      run(`npx tsx ${cliPath} init --db ${dbId} --name "Test Wiki"`, testDir);
     }
 
     await writeFile(

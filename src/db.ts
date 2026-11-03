@@ -17,8 +17,6 @@ CREATE TABLE IF NOT EXISTS wiki_index (
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-DROP TABLE IF EXISTS wiki_sources;
-
 CREATE TABLE IF NOT EXISTS wiki_page_sources (
   page_slug TEXT NOT NULL,
   source_path TEXT NOT NULL,

@@ -1,6 +1,7 @@
-import { readFile, readdir, stat } from "node:fs/promises";
-import { basename, extname, join, relative } from "node:path";
+import { readdir, lstat } from "node:fs/promises";
+import { basename, extname, join, relative, resolve } from "node:path";
 import { contentHash } from "./hash.js";
+import { ensureSafeDirectory, readSafeFile } from "./paths.js";
 
 export interface WikiPageFile {
   fullPath: string;
@@ -53,17 +54,15 @@ export interface WikiLink {
 
 export async function collectWikiPageEntries(dir: string, base: string = dir): Promise<WikiPageEntry[]> {
   const entries: WikiPageEntry[] = [];
-  let items: string[];
-
-  try {
-    items = await readdir(dir);
-  } catch {
-    return entries;
-  }
+  await ensureSafeDirectory(base, dir);
+  const items = await readdir(dir);
 
   for (const item of items) {
     const full = join(dir, item);
-    const s = await stat(full);
+    const s = await lstat(full);
+    if (s.isSymbolicLink() || (!s.isDirectory() && !s.isFile())) {
+      throw new Error(`Cannot sync a symlink or special file: ${full}`);
+    }
     if (s.isDirectory()) {
       entries.push(...(await collectWikiPageEntries(full, base)));
       continue;
@@ -87,17 +86,15 @@ export async function collectWikiPageEntries(dir: string, base: string = dir): P
 
 export async function collectSourceFileEntries(dir: string, base: string = dir): Promise<SourceFileEntry[]> {
   const entries: SourceFileEntry[] = [];
-  let items: string[];
-
-  try {
-    items = await readdir(dir);
-  } catch {
-    return entries;
-  }
+  await ensureSafeDirectory(base, dir);
+  const items = await readdir(dir);
 
   for (const item of items) {
     const full = join(dir, item);
-    const s = await stat(full);
+    const s = await lstat(full);
+    if (s.isSymbolicLink() || (!s.isDirectory() && !s.isFile())) {
+      throw new Error(`Cannot sync a symlink or special file: ${full}`);
+    }
     if (s.isDirectory()) {
       entries.push(...(await collectSourceFileEntries(full, base)));
       continue;
@@ -114,7 +111,8 @@ export async function collectSourceFileEntries(dir: string, base: string = dir):
 }
 
 export async function loadWikiPage(entry: WikiPageEntry): Promise<WikiPageFile> {
-  const content = await readFile(entry.fullPath, "utf-8");
+  const root = resolve(entry.fullPath, ...entry.path.split("/").map(() => ".."));
+  const content = (await readSafeFile(root, entry.fullPath)).toString("utf-8");
   return {
     fullPath: entry.fullPath,
     path: entry.path,
@@ -128,7 +126,8 @@ export async function loadWikiPage(entry: WikiPageEntry): Promise<WikiPageFile> 
 }
 
 export async function loadSourceFile(entry: SourceFileEntry): Promise<SourceFile> {
-  const bytes = await readFile(entry.fullPath);
+  const root = resolve(entry.fullPath, ...entry.path.split("/").map(() => ".."));
+  const bytes = await readSafeFile(root, entry.fullPath);
   return {
     fullPath: entry.fullPath,
     path: entry.path,
