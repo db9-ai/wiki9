@@ -49,11 +49,11 @@ db9 login
 db9 create --name my-wiki
 
 # 创建 API token
-db9 token create --name wiki-agent --expires-in-days 36500
+db9 token create --name wiki-agent --expires-in-days 30
 
 # 初始化 wiki
 cd my-knowledge-base
-wiki9 init --db <database-id> --token <api-token>
+wiki9 init --db <database-id>  # 使用 DB9 登录凭据，也可设置 WIKI9_TOKEN
 ```
 
 生成的目录结构：
@@ -79,7 +79,7 @@ my-knowledge-base/
 ## CLI 命令
 
 ```bash
-wiki9 init --db <id> --token <token>   # 初始化项目 + DB9 schema
+wiki9 init --db <id>                     # 使用 DB9 登录凭据或 WIKI9_TOKEN 初始化
 wiki9 sync                              # 同步本地文件 → DB9（向量索引 + fs9 备份）
 wiki9 search "查询内容"                  # 语义搜索 wiki 页面
 wiki9 index                             # 列出所有页面（slug、标题、描述、标签）
@@ -146,6 +146,28 @@ updated: 2026-04-07
 4. 根据页面 frontmatter 中的 `sources` 重建 `wiki_page_sources`
 5. 所有文件备份到 DB9 的 fs9 文件系统
 
+### 安全同步与共享范围
+
+一个 DB9 实例对应一本共享知识库。能访问该实例的人可能取得页面以及 `sources/` 中的**全部原始文件**，包括二进制文件。访问权限由 DB9 凭据控制；wiki9 不提供成员私有空间或独立角色系统。需要隔离的内容应使用不同实例。
+
+正常同步仍会传播上次成功同步后在本地删除的页面、来源和日志。目录缺失、读取失败、符号链接或特殊文件会中止同步，不会被当成已删除内容。请将需要同步的文件复制到 `wiki/`、`sources/`，不要在其中放符号链接；生成的 `.claude/skills` 链接仍可使用。
+
+同步记录缺失、损坏、属于其他数据库或使用旧格式时，会执行全量扫描；对于记录之外、只存在于远端的内容，会列出清单并拒绝删除。可以先用 `wiki9 init --db <id>` 恢复缺失文件。如果确实要用完整的本地副本替换远端，核对差异后执行：
+
+```bash
+wiki9 sync --full --prune
+```
+
+`--prune` 必须搭配 `--full`；单独 `--full` 仍保留上述保护。远端恢复失败时必须重试 `init`，之后才能同步。初始化不会覆盖已有本地文件，因此存在内容冲突时需先合并。
+
+同步会记录远端索引、引用关系和文件元数据。下次同步前若发现远端已变化，会在修改内容前停止，避免旧副本直接覆盖其他写入者的改动。可在另一个目录恢复最新远端内容，再合并到当前副本；只有核对合并结果后，才使用显式替换命令。写入者仍需协调：此检查不是分布式锁，同时执行的同步不保证 SQL 和文件操作整体原子完成。同步中途失败时，也应先核对并合并本地和远端，再显式替换。fs9 镜像会跟随删除，不是带历史版本的备份。
+
+### 凭据
+
+省略 `--token` 可使用现有的 `db9 login` 凭据，也可以通过 shell 的保密输入方式或密钥管理工具设置 `WIKI9_TOKEN`。环境变量令牌会在本次命令中覆盖配置，但初始化不会将它写入配置。初始化时显式指定的 `--token` 优先于环境变量。空的 `WIKI9_TOKEN` 会报错；需要使用配置或登录凭据时请取消该环境变量。已有 `--token` 选项继续支持，会将令牌保存到 `wiki9.toml`；避免把真实令牌写进 shell 历史或进程参数。
+
+配置文件权限为仅当前用户可读写（`0600`）；读取已有配置时也会收紧权限。初始化会为 `wiki9.toml` 和 `.wiki9/` 添加完整忽略规则；已被 Git 跟踪的文件仍需从版本管理中移除。同一数据库重复初始化并传入 `--token` 会替换已保存令牌，保留知识库名称和搜索设置。使用 `db9 token revoke <token-id>` 撤销旧令牌或泄露的令牌，并按实际任务选择有效期。配置令牌为空时，SDK 会读取本机 DB9 登录凭据；没有可用凭据就报错，并不会绕过认证。
+
 ## 开发
 
 ```bash
@@ -153,7 +175,8 @@ npm install
 npm run dev -- sync           # 开发模式运行命令
 npm run build                 # 用 tsup 构建
 npm run typecheck             # 类型检查
-npx vitest run                # 运行集成测试（默认实时创建临时 DB9 实例）
+npx vitest run test/safety.test.ts       # 离线回归测试
+npx vitest run test/integration.test.ts  # 真实 DB9 集成测试（临时实例）
 ```
 
 如果账号已达到 DB9 数据库数量上限，可以设置 `WIKI9_TEST_DB_ID` 指向一个专门用于测试、可安全复用的数据库；也可以设置 `WIKI9_TEST_TOKEN` 显式提供测试 token。

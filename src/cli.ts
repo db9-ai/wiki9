@@ -16,8 +16,8 @@ program
   .command("init")
   .description("Initialize a new wiki project")
   .requiredOption("--db <id>", "DB9 database ID")
-  .requiredOption("--token <token>", "DB9 access token")
-  .option("--name <name>", "Wiki name", "My Knowledge Base")
+  .option("--token <token>", "DB9 access token (prefer WIKI9_TOKEN or db9 login)")
+  .option("--name <name>", "Wiki name")
   .action(async (opts) => {
     await initCommand(opts.db, opts.token, opts.name);
   });
@@ -26,8 +26,9 @@ program
   .command("sync")
   .description("Sync local wiki to DB9 (fs9 backup + vector index)")
   .option("--full", "Force a full sync instead of using the last successful sync timestamp")
+  .option("--prune", "With --full, explicitly remove remote-only data outside the saved sync state")
   .action(async (opts) => {
-    await syncCommand({ full: opts.full });
+    await syncCommand({ full: opts.full, prune: opts.prune });
   });
 
 program
