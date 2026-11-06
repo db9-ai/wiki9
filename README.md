@@ -153,19 +153,31 @@ One DB9 instance is one shared knowledge base. Everyone with access to that inst
 
 Normal sync still propagates local page, source, and log deletions recorded by the last successful sync. Missing directories, unreadable files, symlinks, and special files abort synchronization instead of being treated as deleted content. Copy the intended files into `wiki/` or `sources/` rather than placing symlinks there. The generated `.claude/skills` link remains supported.
 
-When the saved state is absent, invalid, belongs to another database, or uses an older format, sync performs a full scan. It lists and refuses to delete remote-only content that is outside that state. Restore missing files with `wiki9 init --db <id>` first. To deliberately replace the remote wiki with the complete local copy, review the differences and run:
+Local changes are detected by full SHA-256 content hashes, including binary sources and `log.md`; preserving a file's old modification time does not hide a change. Each sync reads local content to compute these hashes, while uploads and embeddings remain incremental. Version-two sync records migrate after a successful sync, retaining their tracked paths and remote conflict check. An incompatible or invalid record cannot authorize implicit remote cleanup.
+
+Every sync path uses the same deletion checks and displays its deletion targets before execution. When the saved state is absent, invalid, or belongs to another database, sync performs a full scan. It lists and refuses to delete remote-only content that is outside that state. Restore missing files with `wiki9 init --db <id>` first. To deliberately replace the remote wiki with the complete local copy, review the differences and run:
 
 ```bash
 wiki9 sync --full --prune
 ```
 
-`--prune` requires `--full`. A normal `--full` rescan preserves the same protection. A failed restore must be retried with `init` before sync can proceed. Init preserves existing local files, so merge conflicting content before syncing.
+`--prune` requires `--full`. This explicit replacement rewrites local pages' remote index fields and embeddings, uploads all local pages, sources and logs even when remote hashes or timestamps match, and deletes remote-only content. It can incur full upload and embedding costs. A normal `--full` rescan preserves deletion protection and skips unchanged content. A failed restore must be retried with `init` before sync can proceed. Init preserves existing local files, so merge conflicting content before syncing.
 
 Sync records the remote index, references, and file metadata. If these change before the next sync, it stops before updating content so a stale directory cannot silently replace another writer's changes. Restore the current remote copy in a separate directory and merge it into the working copy; use the explicit replacement command only after reviewing the merged copy. Coordinate writers: this check is not a distributed lock, and simultaneous syncs are not atomic across SQL and file storage. After a partially failed sync, inspect and reconcile both copies before explicitly replacing remote data. The fs9 mirror follows deletions and is not a versioned backup.
 
+Local state is not a security boundary against another process with the same account and DB9 credential. Unsupported path names, including backslashes and control characters, fail before synchronization instead of being silently skipped or renamed. Ordinary Unicode, spaces, and apostrophes remain supported.
+
+Restored pages, binary sources and logs are created with owner-only permissions (`0600`), and newly created private content directories use `0700`. Existing files and directory permissions are preserved; review those separately when sharing a host or working directory. Sources remain normal files, not enforced immutable storage.
+
+### Agent output and local operation records
+
+`search`, `index`, and `status` support `--json` for structured content data. Human-readable output escapes terminal controls and shortens long summaries; JSON preserves metadata values and escapes control bytes. Neither format makes retrieved instructions trustworthy. Generated agent instructions and skills treat wiki/source contents and results as data, not permission to run commands, access credentials, export content, or delete files. Wiki names are escaped when generating the Markdown title without changing their saved value. Existing `AGENTS.md` and skill files are not overwritten by init; review and update older generated instructions manually.
+
+`.wiki9/operations.jsonl` contains local timestamps, run IDs, database targets, deletion plans and outcomes, and init/schema/credential-update events. It does not contain credential values, document bodies or raw backend error responses. The file is owner-only and append-written; a write failure warns without claiming to roll back a successful remote operation. It is a best-effort troubleshooting record, not a tamper-proof audit service, and is not mirrored remotely. `log.md` remains the agent-maintained edit history, append-only by convention, with ordinary mirror replacement and deletion behavior. Keep credentials and unnecessary sensitive material out of edit logs.
+
 ### Credentials
 
-Omit `--token` to use your existing `db9 login`, or provide `WIKI9_TOKEN` through your shell's secret input mechanism or secret manager. Environment tokens override the config for that invocation and are not written by init. An explicit init `--token` takes precedence over the environment. An empty `WIKI9_TOKEN` is rejected; unset it to use configured or login credentials. The existing `--token` option remains available; it stores the token in `wiki9.toml`, so avoid putting literal secrets in shell history or process arguments.
+Omit `--token` to use your existing `db9 login`, or provide `WIKI9_TOKEN` through your shell's secret input mechanism or secret manager. Environment tokens override the config for that invocation and are not written by init. An explicit init `--token` takes precedence over the environment. An empty `WIKI9_TOKEN` is rejected; unset it to use configured or login credentials. The existing `--token` option remains available and prints a warning without echoing the value; it stores the token in `wiki9.toml`, so avoid putting literal secrets in shell history or process arguments. Keeping this compatibility option retains those exposure risks.
 
 Config files use owner-only permissions (`0600`); existing permissions are tightened when read. Init adds exact ignore rules for `wiki9.toml` and `.wiki9/`. Keep them out of version control, including files already tracked by Git. Running init again for the same database with `--token` replaces the stored token while retaining the wiki name and search settings. Revoke replaced or exposed tokens with `db9 token revoke <token-id>`, and choose an expiry suited to the task rather than an effectively permanent token. An empty configured token uses the SDK's local DB9 login credentials and fails if none are available; it does not bypass authentication.
 
@@ -176,7 +188,7 @@ npm install
 npm run dev -- sync           # Run commands in dev mode
 npm run build                 # Build with tsup
 npm run typecheck             # Type check
-npx vitest run test/safety.test.ts       # Offline regression tests
+npx vitest run test/safety.test.ts test/output.test.ts test/errors.test.ts  # Offline regression tests
 npx vitest run test/integration.test.ts  # Live integration tests (temporary DB9 database)
 ```
 

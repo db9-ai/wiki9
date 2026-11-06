@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { stringify } from "smol-toml";
@@ -8,7 +8,7 @@ import { syncCommand } from "../src/commands/sync.js";
 import { initCommand } from "../src/commands/init.js";
 import { collectSourceFiles, collectWikiPages } from "../src/utils/wiki.js";
 import { remoteChildPath, writeSafeFileIfMissing } from "../src/utils/paths.js";
-import { contentHash } from "../src/utils/hash.js";
+import { contentHash, fileHash } from "../src/utils/hash.js";
 import { createClient } from "../src/db.js";
 
 vi.mock("node:fs/promises", async (original) => {
@@ -20,7 +20,7 @@ const remote = vi.hoisted(() => ({
   files: new Map<string, { bytes: Buffer; mtime: string }>(),
   index: new Map<string, string>(), links: new Set<string>(),
   calls: [] as string[], clock: 0, failInsertLinks: false, failWrite: false,
-  failList: false, maliciousEntry: "", failSchema: false,
+  failList: false, maliciousEntry: "", failSchema: false, failRemove: "",
 }));
 const missing = () => Object.assign(new Error("not found"), { code: "ENOENT" });
 const fsClient = {
@@ -48,9 +48,19 @@ const fsClient = {
     remote.files.set(path, { bytes, mtime: new Date(2_000_000_000_000 + remote.clock++).toISOString() });
     return bytes.length;
   }),
-  rm: vi.fn(async (path: string) => { remote.files.delete(path); }),
+  rm: vi.fn(async (path: string) => {
+    if (path === remote.failRemove) throw new Error("remove unavailable SECRET");
+    remote.files.delete(path);
+  }),
   close: vi.fn(async () => {}),
 };
+function sqlStrings(sql: string): string[] {
+  return [...sql.matchAll(/(E)?'((?:''|\\[\s\S]|[^'])*)'/g)].map((match) => {
+    if (!match[1]) return match[2].replace(/''/g, "'");
+    return match[2].replace(/''|\\([\s\S])/g, (escaped, character: string) =>
+      escaped === "''" ? "'" : ({ n: "\n", r: "\r", t: "\t" }[character] ?? character));
+  });
+}
 const client = {
   fs: {
     connect: vi.fn(async () => fsClient),
@@ -74,22 +84,24 @@ vi.mock("../src/db.js", () => ({
     else if (sql.includes("SELECT page_slug, source_path")) {
       rows = [...remote.links].sort().map((link) => link.split("\0"));
       if (sql.includes("WHERE page_slug IN")) {
-        rows = rows.filter(([slug]) => sql.includes(`'${slug}'`));
+        const slugs = sqlStrings(sql);
+        rows = rows.filter(([slug]) => slugs.includes(slug));
       }
     } else if (sql.includes("INSERT INTO wiki_index")) {
-      const slug = sql.match(/VALUES \('([^']+)'/)![1];
-      remote.index.set(slug, sql.match(/'([a-f0-9]{16})'/)![1]);
+      const [slug, , , hash] = sqlStrings(sql);
+      remote.index.set(slug, hash);
     } else if (sql.includes("UPDATE wiki_index")) {
-      remote.index.set(sql.match(/WHERE slug = '([^']+)'/)![1], sql.match(/content_hash = '([^']+)'/)![1]);
+      remote.index.set(sqlStrings(sql.slice(sql.indexOf("WHERE")))[0], sql.match(/content_hash = '([^']+)'/)![1]);
     } else if (sql.includes("DELETE FROM wiki_index")) {
-      for (const slug of remote.index.keys()) if (sql.includes(`'${slug}'`)) remote.index.delete(slug);
+      const slugs = sqlStrings(sql);
+      for (const slug of remote.index.keys()) if (slugs.includes(slug)) remote.index.delete(slug);
     } else if (sql.includes("INSERT INTO wiki_page_sources")) {
       if (remote.failInsertLinks) throw new Error("reference insert failed");
-      for (const pair of sql.matchAll(/\('([^']+)', '([^']+)'\)/g)) remote.links.add(`${pair[1]}\0${pair[2]}`);
+      const values = sqlStrings(sql);
+      for (let offset = 0; offset < values.length; offset += 2) remote.links.add(`${values[offset]}\0${values[offset + 1]}`);
     } else if (sql.includes("DELETE FROM wiki_page_sources")) {
-      for (const pair of sql.matchAll(/page_slug = '([^']+)' AND source_path = '([^']+)'/g)) {
-        remote.links.delete(`${pair[1]}\0${pair[2]}`);
-      }
+      const values = sqlStrings(sql);
+      for (let offset = 0; offset < values.length; offset += 2) remote.links.delete(`${values[offset]}\0${values[offset + 1]}`);
     }
     return { rows, columns: [], row_count: rows.length };
   }),
@@ -120,6 +132,7 @@ beforeEach(async () => {
   remote.files.clear(); remote.index.clear(); remote.links.clear(); remote.calls.length = 0;
   remote.failInsertLinks = remote.failWrite = remote.failList = remote.failSchema = false;
   remote.maliciousEntry = ""; remote.clock = 0;
+  remote.failRemove = "";
   vi.mocked(readdir).mockClear(); fsClient.rm.mockClear(); fsClient.writeFile.mockClear();
 });
 afterEach(async () => {
@@ -135,6 +148,24 @@ describe("file boundaries", () => {
     await writeFile(join(dir, "sources", "image.bin"), bytes);
     expect((await collectWikiPages(join(dir, "wiki")))[0].slug).toBe("nested/topic");
     expect((await collectSourceFiles(join(dir, "sources")))[0].bytes).toEqual(bytes);
+  });
+  it.each(["bad\\name.md", "bad\nname.md", "bad\tname.md"])("rejects unsupported local names before SQL writes: %j", async (name) => {
+    await localPage(name);
+    await expect(syncCommand()).rejects.toThrow(/Unsupported local path/);
+    expect(remote.calls).toEqual([]);
+    expect(fsClient.writeFile).not.toHaveBeenCalled();
+  });
+  it("rejects unsupported source filenames before remote writes", async () => {
+    await writeFile(join(dir, "sources", "bad\nfile.bin"), "source");
+    await expect(syncCommand()).rejects.toThrow(/Unsupported local path/);
+    expect(remote.calls).toEqual([]);
+  });
+  it("hashes binary files with the complete SHA-256 digest", async () => {
+    const bytes = Buffer.alloc(200_000, 173);
+    const path = join(dir, "sources", "large.bin");
+    await writeFile(path, bytes);
+    expect(await fileHash(dir, path)).toBe(contentHash(bytes));
+    expect(contentHash(bytes)).toHaveLength(64);
   });
   it.each(["wiki", "sources"])("rejects file symlinks in %s", async (sub) => {
     await writeFile(join(outside, "secret"), "secret");
@@ -239,6 +270,117 @@ describe("sync integrity", () => {
     expect(fsClient.writeFile).not.toHaveBeenCalled();
     expect(remote.index.get("topic")).toBe(contentHash("# Topic\n"));
   });
+  it.each([false, true])("uploads changes that preserve old mtimes and sizes (full: %s)", async (full) => {
+    await localPage("topic.md", "AAAA");
+    await writeFile(join(dir, "sources", "data.bin"), Buffer.from([0, 1]));
+    await writeFile(join(dir, "log.md"), "AAAA");
+    await syncCommand();
+    await localPage("topic.md", "BBBB");
+    await writeFile(join(dir, "sources", "data.bin"), Buffer.from([0, 2]));
+    await writeFile(join(dir, "log.md"), "BBBB");
+    const old = new Date("2000-01-01");
+    for (const path of ["wiki/topic.md", "sources/data.bin", "log.md"]) await utimes(join(dir, path), old, old);
+    await syncCommand({ full });
+    expect(remote.index.get("topic")).toBe(contentHash("BBBB"));
+    expect(remote.files.get("/wiki/topic.md")!.bytes.toString()).toBe("BBBB");
+    expect(remote.files.get("/sources/data.bin")!.bytes).toEqual(Buffer.from([0, 2]));
+    expect(remote.files.get("/log.md")!.bytes.toString()).toBe("BBBB");
+  });
+  it("does not upload or re-embed content after only its mtime changes", async () => {
+    await localPage();
+    await syncCommand();
+    fsClient.writeFile.mockClear(); remote.calls.length = 0;
+    const later = new Date(Date.now() + 60_000);
+    await utimes(join(dir, "wiki", "topic.md"), later, later);
+    await syncCommand();
+    expect(fsClient.writeFile).not.toHaveBeenCalled();
+    expect(remote.calls.some((sql) => /INSERT|UPDATE/.test(sql))).toBe(false);
+  });
+  it("rebuilds matching-hash index rows and same-size poisoned files only on explicit replacement", async () => {
+    await localPage("topic.md", "GOOD");
+    await writeFile(join(dir, "sources", "data.bin"), Buffer.from([0, 1]));
+    await writeFile(join(dir, "log.md"), "GOOD");
+    await syncCommand();
+    for (const path of ["/wiki/topic.md", "/log.md"]) {
+      const file = remote.files.get(path)!;
+      file.bytes = Buffer.from("EVIL");
+    }
+    remote.files.get("/sources/data.bin")!.bytes = Buffer.from([1, 0]);
+    remote.calls.length = 0;
+    await syncCommand({ full: true, prune: true });
+    expect(remote.calls.some((sql) => sql.includes("UPDATE wiki_index") && sql.includes("embedding("))).toBe(true);
+    expect(remote.files.get("/wiki/topic.md")!.bytes.toString()).toBe("GOOD");
+    expect(remote.files.get("/sources/data.bin")!.bytes).toEqual(Buffer.from([0, 1]));
+    expect(remote.files.get("/log.md")!.bytes.toString()).toBe("GOOD");
+  });
+  it("migrates a genuine version-two snapshot without false conflicts or losing tracked deletions", async () => {
+    await localPage("topic.md", "# Topic\n");
+    await localPage("removed.md", "# Removed\n");
+    await syncCommand();
+    const statePath = join(dir, ".wiki9", "sync-state.json");
+    const state = JSON.parse(await readFile(statePath, "utf-8"));
+    for (const [slug, hash] of remote.index) remote.index.set(slug, hash.slice(0, 16));
+    const index = [...remote.index].sort();
+    const files = [...remote.files].map(([path, file]) => ({
+      path, size: file.bytes.length, mtime: file.mtime,
+    })).sort((left, right) => left.path.localeCompare(right.path));
+    state.version = 2;
+    state.remoteSnapshot = contentHash(JSON.stringify([index, [], files])).slice(0, 16);
+    delete state.fileHashes;
+    await writeFile(statePath, JSON.stringify(state));
+    await unlink(join(dir, "wiki", "removed.md"));
+    await syncCommand();
+    expect(remote.index.has("removed")).toBe(false);
+    expect(remote.files.has("/wiki/removed.md")).toBe(false);
+    expect(remote.index.get("topic")).toHaveLength(64);
+    const migrated = JSON.parse(await readFile(statePath, "utf-8"));
+    expect(migrated.version).toBe(3);
+    expect(migrated.fileHashes["wiki/topic.md"]).toBe(contentHash("# Topic\n"));
+    expect(migrated.remoteSnapshot).toHaveLength(64);
+  });
+  it("retains the remote conflict guard while migrating version-two snapshots", async () => {
+    await localPage();
+    await syncCommand();
+    const statePath = join(dir, ".wiki9", "sync-state.json");
+    const state = JSON.parse(await readFile(statePath, "utf-8"));
+    state.version = 2;
+    state.remoteSnapshot = state.remoteSnapshot.slice(0, 16);
+    delete state.fileHashes;
+    await writeFile(statePath, JSON.stringify(state));
+    await seedRemote("/wiki/other.md", "changed remotely");
+    fsClient.writeFile.mockClear();
+    await expect(syncCommand()).rejects.toThrow(/Remote data changed/);
+    expect(fsClient.writeFile).not.toHaveBeenCalled();
+  });
+  it("protects remote-only content on the lightweight path even if the saved snapshot matches it", async () => {
+    await localPage();
+    await syncCommand();
+    await seedRemote("/sources/untracked.bin", Buffer.from([7]));
+    const statePath = join(dir, ".wiki9", "sync-state.json");
+    const state = JSON.parse(await readFile(statePath, "utf-8"));
+    const files = [...remote.files].map(([path, file]) => ({
+      path, size: file.bytes.length, mtime: file.mtime,
+    })).sort((left, right) => left.path.localeCompare(right.path));
+    state.remoteSnapshot = contentHash(JSON.stringify([[...remote.index].sort(), [], files]));
+    await writeFile(statePath, JSON.stringify(state));
+    await expect(syncCommand()).rejects.toThrow(/Remote data was not changed/);
+    expect(remote.files.has("/sources/untracked.bin")).toBe(true);
+  });
+  it("supports ordinary apostrophes, Unicode and spaces across repeat syncs and reference changes", async () => {
+    const source = "资料's file.bin";
+    await localPage("目录/topic's name.md", `---\ntags: [team's tag]\nsources: [${source}]\n---\n# Topic`);
+    await writeFile(join(dir, "sources", source), Buffer.from([0, 255]));
+    await syncCommand();
+    expect(remote.index.has("目录/topic's name")).toBe(true);
+    expect(remote.links.has(`目录/topic's name\0${source}`)).toBe(true);
+    await syncCommand();
+    await localPage("目录/topic's name.md", "---\nsources: []\n---\n# Updated");
+    await syncCommand();
+    expect(remote.links.size).toBe(0);
+    await unlink(join(dir, "wiki", "目录", "topic's name.md"));
+    await syncCommand();
+    expect(remote.index.size).toBe(0);
+  });
   it("stops a stale directory before it overwrites another writer", async () => {
     await localPage(); await syncCommand();
     await seedRemote("/wiki/topic.md", "# Edited elsewhere");
@@ -273,6 +415,47 @@ describe("sync integrity", () => {
   });
   it("requires --full with --prune", async () => {
     await expect(syncCommand({ prune: true })).rejects.toThrow(/requires --full/);
+  });
+  it("records deletion plans and partial failures without secrets or claiming success", async () => {
+    await localPage("first.md", "first");
+    await localPage("second.md", "second");
+    await syncCommand();
+    const statePath = join(dir, ".wiki9", "sync-state.json");
+    const before = await readFile(statePath, "utf-8");
+    await unlink(join(dir, "wiki", "first.md"));
+    await unlink(join(dir, "wiki", "second.md"));
+    remote.failRemove = "/wiki/second.md";
+    await expect(syncCommand()).rejects.toThrow(/File sync failed/);
+    expect(await readFile(statePath, "utf-8")).toBe(before);
+    const log = await readFile(join(dir, ".wiki9", "operations.jsonl"), "utf-8");
+    expect(log).not.toMatch(/test-token|SECRET|remove unavailable/);
+    const entries = log.trim().split("\n").map((line) => JSON.parse(line));
+    const runId = entries.at(-1).runId;
+    const failedRun = entries.filter((entry) => entry.runId === runId);
+    expect(failedRun.some((entry) => entry.outcome === "planned")).toBe(true);
+    expect(failedRun.some((entry) => entry.operation === "delete-file" && entry.outcome === "succeeded")).toBe(true);
+    expect(failedRun.some((entry) => entry.operation === "delete-file" && entry.outcome === "failed")).toBe(true);
+    expect(failedRun.at(-1)).toMatchObject({ operation: "sync", outcome: "failed" });
+    expect((await lstat(join(dir, ".wiki9", "operations.jsonl"))).mode & 0o777).toBe(0o600);
+  });
+  it("warns about unavailable operation records without discarding a successful sync", async () => {
+    await mkdir(join(dir, ".wiki9"));
+    await mkdir(join(dir, ".wiki9", "operations.jsonl"));
+    await localPage();
+    await syncCommand();
+    expect(console.error).toHaveBeenCalledWith("Warning: could not write the local operation record.");
+    expect(remote.index.has("topic")).toBe(true);
+    expect(await readFile(join(dir, ".wiki9", "sync-state.json"), "utf-8")).toContain('"version": 3');
+  });
+  it("does not follow a substituted operation log symlink", async () => {
+    await mkdir(join(dir, ".wiki9"));
+    const target = join(outside, "untouched");
+    await writeFile(target, "keep");
+    await symlink(target, join(dir, ".wiki9", "operations.jsonl"));
+    await localPage();
+    await syncCommand();
+    expect(await readFile(target, "utf-8")).toBe("keep");
+    expect(console.error).toHaveBeenCalledWith("Warning: could not write the local operation record.");
   });
   it("does not drop the legacy table during schema initialization", async () => {
     const { initSchema } = await vi.importActual<typeof import("../src/db.js")>("../src/db.js");
@@ -309,6 +492,9 @@ describe("initialization and credentials", () => {
       db9: { database: "test-db", token: "explicit-token" },
     }));
     expect((await loadConfig(dir, false)).db9.token).toBe("explicit-token");
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("--token may expose"));
+    const output = vi.mocked(console.error).mock.calls.flat().join("\n");
+    expect(output).not.toMatch(/explicit-token|environment-token/);
   });
   it("escapes TOML values, rotates tokens and retains the skills link", async () => {
     const name = 'Name "quoted"\n[extra]'; const token = 'token"\\\n';
@@ -316,6 +502,9 @@ describe("initialization and credentials", () => {
     await initCommand("test-db", token, name);
     const loaded = await loadConfig();
     expect(loaded.wiki.name).toBe(name); expect(loaded.db9.token).toBe(token);
+    const agents = await readFile(join(dir, "AGENTS.md"), "utf-8");
+    expect(agents.split("\n")[0]).toContain('Name "quoted"');
+    expect(agents).not.toContain("\n[extra]");
     expect((await lstat(join(dir, ".claude", "skills"))).isSymbolicLink()).toBe(true);
     expect((await readFile(join(dir, ".gitignore"), "utf-8")).split("\n")).toContain("wiki9.toml");
     await initCommand("test-db", "replacement");
@@ -346,6 +535,19 @@ describe("initialization and credentials", () => {
     expect(await readFile(join(dir, "wiki", "topic.md"), "utf-8")).toBe("# Topic\n");
     expect(await readFile(join(dir, "wiki", "nested", "other.md"), "utf-8")).toBe("remote other");
     expect(await readFile(join(dir, "sources", "data.bin"))).toEqual(Buffer.from([0, 255]));
+    for (const path of ["wiki/nested/other.md", "sources/data.bin", "log.md"]) {
+      expect((await lstat(join(dir, path))).mode & 0o777).toBe(0o600);
+    }
+    expect((await lstat(join(dir, "wiki", "nested"))).mode & 0o777).toBe(0o700);
+    expect((await lstat(join(dir, "wiki", "topic.md"))).mode & 0o777).toBe(0o644);
+  });
+  it("preserves existing agent instructions while recording credential updates without values", async () => {
+    await writeFile(join(dir, "AGENTS.md"), "# User instructions\n");
+    await initCommand("test-db", "SECRET-credential", "New\n## Injected");
+    expect(await readFile(join(dir, "AGENTS.md"), "utf-8")).toBe("# User instructions\n");
+    const log = await readFile(join(dir, ".wiki9", "operations.jsonl"), "utf-8");
+    expect(log).toContain('"operation":"credential-update"');
+    expect(log).not.toContain("SECRET-credential");
   });
   it("leaves a failed restore blocked until init succeeds", async () => {
     remote.failSchema = true;

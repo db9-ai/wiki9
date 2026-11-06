@@ -4,6 +4,7 @@ import { syncCommand } from "./commands/sync.js";
 import { searchCommand } from "./commands/search.js";
 import { indexCommand } from "./commands/index.js";
 import { statusCommand } from "./commands/status.js";
+import { displayText } from "./utils/output.js";
 
 const program = new Command();
 
@@ -25,8 +26,8 @@ program
 program
   .command("sync")
   .description("Sync local wiki to DB9 (fs9 backup + vector index)")
-  .option("--full", "Force a full sync instead of using the last successful sync timestamp")
-  .option("--prune", "With --full, explicitly remove remote-only data outside the saved sync state")
+  .option("--full", "Rescan all local content instead of only syncing changed content")
+  .option("--prune", "With --full, rebuild remote content from local files and remove remote-only data")
   .action(async (opts) => {
     await syncCommand({ full: opts.full, prune: opts.prune });
   });
@@ -34,22 +35,28 @@ program
 program
   .command("search <query>")
   .description("Semantic search across wiki pages")
-  .action(async (query) => {
-    await searchCommand(query);
+  .option("--json", "Return structured wiki data")
+  .action(async (query, opts) => {
+    await searchCommand(query, { json: opts.json });
   });
 
 program
   .command("index")
   .description("List all wiki pages")
-  .action(async () => {
-    await indexCommand();
+  .option("--json", "Return structured wiki data")
+  .action(async (opts) => {
+    await indexCommand({ json: opts.json });
   });
 
 program
   .command("status")
   .description("Show wiki statistics")
-  .action(async () => {
-    await statusCommand();
+  .option("--json", "Return structured wiki data")
+  .action(async (opts) => {
+    await statusCommand({ json: opts.json });
   });
 
-program.parse();
+program.parseAsync().catch((error: unknown) => {
+  console.error(displayText(error instanceof Error ? error.message : "Command failed."));
+  process.exitCode = 1;
+});

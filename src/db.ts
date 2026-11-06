@@ -1,6 +1,7 @@
 import { createDb9Client, type Db9Client } from "get-db9";
 import WebSocket from "ws";
 import type { WikiConfig } from "./config.js";
+import { backendError } from "./utils/errors.js";
 
 const SCHEMA_SQL = `
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -36,13 +37,22 @@ export function createClient(config: WikiConfig): Db9Client {
 }
 
 export async function initSchema(client: Db9Client, dbId: string): Promise<void> {
-  const result = await client.databases.sql(dbId, SCHEMA_SQL);
+  let result;
+  try {
+    result = await client.databases.sql(dbId, SCHEMA_SQL);
+  } catch (error) {
+    throw backendError("Schema init failed", error);
+  }
   if (result.error) {
-    throw new Error(`Schema init failed: ${JSON.stringify(result.error)}`);
+    throw backendError("Schema init failed", result.error);
   }
   // Try creating HNSW index, ignore if already exists
-  await client.databases.sql(dbId, INDEX_SQL);
-  await client.databases.sql(dbId, PAGE_SOURCES_INDEX_SQL);
+  try {
+    await client.databases.sql(dbId, INDEX_SQL);
+    await client.databases.sql(dbId, PAGE_SOURCES_INDEX_SQL);
+  } catch (error) {
+    throw backendError("Index initialization failed", error);
+  }
 }
 
 export async function execSql(
@@ -50,9 +60,14 @@ export async function execSql(
   dbId: string,
   sql: string,
 ): Promise<{ columns: { name: string; type: string }[]; rows: unknown[][]; row_count: number }> {
-  const result = await client.databases.sql(dbId, sql);
+  let result;
+  try {
+    result = await client.databases.sql(dbId, sql);
+  } catch (error) {
+    throw backendError("SQL request failed", error);
+  }
   if (result.error) {
-    throw new Error(`SQL error: ${JSON.stringify(result.error)}`);
+    throw backendError("SQL request failed", result.error);
   }
   return { columns: result.columns, rows: result.rows, row_count: result.row_count };
 }

@@ -1,11 +1,13 @@
 import { lstat, open, rename } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { contentHash } from "../utils/hash.js";
+import { contentHash, fileHash } from "../utils/hash.js";
 import { ensureSafeDirectory, isNotFound, isRelativeFilePath, readSafeFile, remoteChildPath } from "../utils/paths.js";
 import { loadConfig } from "../config.js";
 import { createClient, execSql, initSchema } from "../db.js";
-import { escapeSqlLiteral, escapeSqlString } from "../utils/sql.js";
+import { escapeSqlLiteral } from "../utils/sql.js";
+import { displayText } from "../utils/output.js";
+import { operationRecorder, type OperationRecorder } from "../utils/operations.js";
 import {
   collectSourceFileEntries,
   collectWikiPageEntries,
@@ -18,7 +20,7 @@ import {
 
 const SYNC_STATE_DIR = ".wiki9";
 const SYNC_STATE_FILE = "sync-state.json";
-const SYNC_STATE_VERSION = 2;
+const SYNC_STATE_VERSION = 3;
 
 interface SyncOptions {
   full?: boolean;
@@ -29,6 +31,7 @@ interface SyncableFile {
   path: string;
   size: number;
   mtimeMs: number;
+  forceWrite?: boolean;
   write(): Promise<number>;
 }
 
@@ -45,27 +48,21 @@ interface SyncState {
   sourcePaths: string[];
   hasLogFile: boolean;
   remoteSnapshot: string;
+  fileHashes: Record<string, string>;
 }
 
-function isEntryChanged(
-  entry: { path: string; mtimeMs: number },
-  lastSyncMs: number,
-  previousPaths: Set<string>,
-): boolean {
-  return entry.mtimeMs > lastSyncMs || !previousPaths.has(entry.path);
-}
-
-function escapeStr(s: string): string {
-  return escapeSqlString(s);
+interface DeletionPlan {
+  paths: string[];
+  slugs: string[];
 }
 
 function escapeArray(arr: string[]): string {
   if (arr.length === 0) return "'{}'";
-  return `ARRAY[${arr.map((t) => `'${escapeStr(t)}'`).join(",")}]`;
+  return `ARRAY[${arr.map(escapeSqlLiteral).join(",")}]`;
 }
 
 function escapeSqlList(values: string[]): string {
-  return values.map((value) => `'${escapeStr(value)}'`).join(", ");
+  return values.map(escapeSqlLiteral).join(", ");
 }
 
 function syncStatePath(dir: string): string {
@@ -77,7 +74,7 @@ async function loadSyncState(dir: string, dbId: string): Promise<SyncState | nul
     const raw = (await readSafeFile(dir, syncStatePath(dir))).toString("utf-8");
     const parsed = JSON.parse(raw) as Partial<SyncState>;
     if (
-      !parsed || parsed.version !== SYNC_STATE_VERSION
+      !parsed || (parsed.version !== 2 && parsed.version !== SYNC_STATE_VERSION)
       || parsed.database !== dbId
       || typeof parsed.lastSuccessfulSyncAt !== "string"
       || !Number.isFinite(Date.parse(parsed.lastSuccessfulSyncAt))
@@ -88,17 +85,30 @@ async function loadSyncState(dir: string, dbId: string): Promise<SyncState | nul
       || !parsed.sourcePaths.every(isRelativeFilePath)
       || typeof parsed.hasLogFile !== "boolean"
       || typeof parsed.remoteSnapshot !== "string"
+      || !(parsed.version === 2 ? /^[a-f0-9]{16}$/ : /^[a-f0-9]{64}$/).test(parsed.remoteSnapshot)
     ) {
       return null;
     }
+    const fileHashes: Record<string, string> | undefined = parsed.version === 2 ? {} : parsed.fileHashes;
+    const paths = [
+      ...parsed.wikiPaths.map((path) => `wiki/${path}`),
+      ...parsed.sourcePaths.map((path) => `sources/${path}`),
+      ...(parsed.hasLogFile ? ["log.md"] : []),
+    ];
+    if (!fileHashes || typeof fileHashes !== "object" || Array.isArray(fileHashes)
+      || (parsed.version === SYNC_STATE_VERSION && (
+        Object.keys(fileHashes).length !== paths.length
+        || !paths.every((path) => Object.hasOwn(fileHashes, path) && /^[a-f0-9]{64}$/.test(fileHashes[path]))
+      ))) return null;
     return {
-      version: SYNC_STATE_VERSION,
+      version: parsed.version,
       database: dbId,
       lastSuccessfulSyncAt: parsed.lastSuccessfulSyncAt,
       wikiPaths: [...new Set(parsed.wikiPaths)],
       sourcePaths: [...new Set(parsed.sourcePaths)],
       hasLogFile: parsed.hasLogFile,
       remoteSnapshot: parsed.remoteSnapshot,
+      fileHashes,
     };
   } catch (error) {
     if (isNotFound(error) || error instanceof SyntaxError) return null;
@@ -114,9 +124,10 @@ async function saveSyncState(
   dbId: string,
   startedAt: string,
   remoteSnapshot: string,
+  fileHashes: Record<string, string>,
 ): Promise<void> {
   const stateDir = join(dir, SYNC_STATE_DIR);
-  await ensureSafeDirectory(dir, stateDir, true);
+  await ensureSafeDirectory(dir, stateDir, true, 0o700);
   const state: SyncState = {
     version: SYNC_STATE_VERSION,
     database: dbId,
@@ -125,6 +136,7 @@ async function saveSyncState(
     sourcePaths: sourceEntries.map((entry) => entry.path).sort(),
     hasLogFile,
     remoteSnapshot,
+    fileHashes,
   };
   const temporaryPath = join(stateDir, `sync-state-${randomUUID()}.tmp`);
   const file = await open(temporaryPath, "wx", 0o600);
@@ -134,6 +146,19 @@ async function saveSyncState(
     await file.close();
   }
   await rename(temporaryPath, syncStatePath(dir));
+}
+
+async function collectLocalHashes(
+  dir: string, wikiEntries: WikiPageEntry[], sourceEntries: SourceFileEntry[], hasLogFile: boolean,
+): Promise<Record<string, string>> {
+  const paths = [
+    ...wikiEntries.map((entry) => `wiki/${entry.path}`),
+    ...sourceEntries.map((entry) => `sources/${entry.path}`),
+    ...(hasLogFile ? ["log.md"] : []),
+  ];
+  const hashes: Record<string, string> = {};
+  for (const path of paths) hashes[path] = await fileHash(dir, join(dir, path));
+  return hashes;
 }
 
 function shouldWriteRemote(
@@ -169,7 +194,7 @@ function pageSourceRowsEqual(local: PageSourceRow[], remote: PageSourceRow[]): b
 
 function buildPageSourceValues(rows: PageSourceRow[]): string {
   return rows
-    .map((row) => `('${escapeStr(row.pageSlug)}', '${escapeStr(row.sourcePath)}')`)
+    .map((row) => `(${escapeSqlLiteral(row.pageSlug)}, ${escapeSqlLiteral(row.sourcePath)})`)
     .join(",\n");
 }
 
@@ -233,11 +258,13 @@ async function inspectRemote(client: ReturnType<typeof createClient>, dbId: stri
       if (!isNotFound(error)) throw error;
     }
     files.sort((a, b) => a.path.localeCompare(b.path));
+    const snapshot = contentHash(JSON.stringify([index.rows, references.rows, files]));
     return {
       indexRows: index.rows,
       referenceRows: references.rows,
       paths: files.map((file) => file.path),
-      snapshot: contentHash(JSON.stringify([index.rows, references.rows, files])),
+      snapshot,
+      legacySnapshot: snapshot.slice(0, 16),
     };
   } finally {
     await fsClient.close();
@@ -248,7 +275,7 @@ function requirePruneApproval(
   remote: Awaited<ReturnType<typeof inspectRemote>>,
   state: SyncState | null, wikiEntries: WikiPageEntry[], sourceEntries: SourceFileEntry[],
   hasLogFile: boolean, prune: boolean,
-): string[] {
+): DeletionPlan {
   const localSlugs = new Set(wikiEntries.map((entry) => entry.slug));
   const previousSlugs = new Set(state?.wikiPaths.map((path) => path.replace(/\.md$/, "")));
   const localPaths = new Set([
@@ -271,18 +298,36 @@ function requirePruneApproval(
   ];
   if (unknown.length > 0) {
     console.log(`Remote-only data outside the saved sync state (${unknown.length} entries):`);
-    for (const path of unknown) console.log(`  ${path}`);
+    for (const path of unknown) console.log(`  ${displayText(path)}`);
     if (!prune) {
       throw new Error("Remote data was not changed. Restore missing files with `wiki9 init`, or review the list and explicitly run `wiki9 sync --full --prune`.");
     }
   }
-  return stalePaths;
+  const slugs = [...new Set([
+    ...remote.indexRows.filter(([slug]) => !localSlugs.has(slug as string)).map(([slug]) => slug as string),
+    ...[...previousSlugs].filter((slug) => !localSlugs.has(slug)),
+  ])];
+  return { paths: stalePaths, slugs };
+}
+
+async function deleteSql(
+  client: ReturnType<typeof createClient>, dbId: string, sql: string, targets: string[],
+  operation: "delete-index" | "delete-references", record: OperationRecorder,
+): Promise<void> {
+  try {
+    await execSql(client, dbId, sql);
+    await record({ operation, outcome: "succeeded", targets });
+  } catch (error) {
+    await record({ operation, outcome: "failed", targets });
+    throw error;
+  }
 }
 
 async function syncPageSourceReferencesFull(
   client: ReturnType<typeof createClient>,
   dbId: string,
   pageSourceRows: PageSourceRow[],
+  record: OperationRecorder,
 ): Promise<void> {
   console.log(`Checking page-source references (${pageSourceRows.length} links)...`);
   const existing = await execSql(
@@ -301,7 +346,7 @@ async function syncPageSourceReferencesFull(
   }
 
   console.log("  page-source links changed; rebuilding...");
-  await reconcilePageSourceReferences(client, dbId, pageSourceRows, existingRows);
+  await reconcilePageSourceReferences(client, dbId, pageSourceRows, existingRows, record);
 }
 
 async function syncPageSourceReferencesLightweight(
@@ -309,6 +354,7 @@ async function syncPageSourceReferencesLightweight(
   dbId: string,
   pageSourceRows: PageSourceRow[],
   affectedSlugs: string[],
+  record: OperationRecorder,
 ): Promise<void> {
   console.log(`Checking page-source references (${affectedSlugs.length} affected pages)...`);
   if (affectedSlugs.length === 0) {
@@ -332,12 +378,13 @@ async function syncPageSourceReferencesLightweight(
   }
 
   console.log("  page-source links changed; updating affected pages...");
-  await reconcilePageSourceReferences(client, dbId, pageSourceRows, existingRows);
+  await reconcilePageSourceReferences(client, dbId, pageSourceRows, existingRows, record);
 }
 
 async function reconcilePageSourceReferences(
   client: ReturnType<typeof createClient>, dbId: string,
   desired: PageSourceRow[], existing: PageSourceRow[],
+  record: OperationRecorder,
 ): Promise<void> {
   const desiredByKey = new Map(desired.map((row) => [pageSourceKey(row), row]));
   const existingKeys = new Set(existing.map(pageSourceKey));
@@ -351,8 +398,9 @@ async function reconcilePageSourceReferences(
   }
   for (const chunk of chunkRows(existing.filter((row) => !desiredByKey.has(pageSourceKey(row))), 200)) {
     const predicates = chunk.map((row) =>
-      `(page_slug = '${escapeStr(row.pageSlug)}' AND source_path = '${escapeStr(row.sourcePath)}')`);
-    await execSql(client, dbId, `DELETE FROM wiki_page_sources WHERE ${predicates.join(" OR ")}`);
+      `(page_slug = ${escapeSqlLiteral(row.pageSlug)} AND source_path = ${escapeSqlLiteral(row.sourcePath)})`);
+    await deleteSql(client, dbId, `DELETE FROM wiki_page_sources WHERE ${predicates.join(" OR ")}`,
+      chunk.map((row) => `${row.pageSlug} -> ${row.sourcePath}`), "delete-references", record);
   }
   logProgress("page-source links", desiredByKey.size, desiredByKey.size);
 }
@@ -374,7 +422,7 @@ async function syncFs9Files(
   const progressInterval = Math.max(1, Math.min(25, Math.floor(files.length / 4)));
   for (const [index, file] of files.entries()) {
     let shouldWrite = true;
-    if (statFile) {
+    if (statFile && !file.forceWrite) {
       let remote: { type: string; size: number; mtime: string } | null = null;
       try {
         remote = await statFile(file.path);
@@ -406,6 +454,7 @@ async function removeFs9Paths(
   statsLabel: string,
   progressLabel: string,
   removePath: (path: string) => Promise<void>,
+  record: OperationRecorder,
 ): Promise<number> {
   if (paths.length === 0) {
     console.log(`  ${statsLabel}: no remote files to remove`);
@@ -415,7 +464,13 @@ async function removeFs9Paths(
   let removed = 0;
   const progressInterval = Math.max(1, Math.min(25, Math.floor(paths.length / 4)));
   for (const [index, path] of paths.entries()) {
-    await removePath(path);
+    try {
+      await removePath(path);
+      await record({ operation: "delete-file", outcome: "succeeded", targets: [path] });
+    } catch (error) {
+      await record({ operation: "delete-file", outcome: "failed", targets: [path] });
+      throw error;
+    }
     removed++;
     const processed = index + 1;
     if (processed === paths.length || processed % progressInterval === 0) {
@@ -455,7 +510,11 @@ async function performFullSync(
   dir: string,
   wikiEntries: WikiPageEntry[],
   sourceEntries: SourceFileEntry[],
-  staleRemotePaths: string[],
+  deletionPlan: DeletionPlan,
+  state: SyncState | null,
+  fileHashes: Record<string, string>,
+  forceRewrite: boolean,
+  record: OperationRecorder,
 ): Promise<{ created: number; updated: number; deleted: number; unchanged: number; referencedSourcePaths: Set<string>; pageSourceRows: PageSourceRow[]; hasLogFile: boolean }> {
   const wikiFiles = await Promise.all(wikiEntries.map(loadWikiPage));
   const sourceFiles = await Promise.all(sourceEntries.map(loadSourceFile));
@@ -471,7 +530,6 @@ async function performFullSync(
   let updated = 0;
   let deleted = 0;
   let unchanged = 0;
-  const localSlugs = new Set(wikiFiles.map((file) => file.slug));
   const pageSourceRows: PageSourceRow[] = [];
   const referencedSourcePaths = new Set<string>();
 
@@ -489,12 +547,12 @@ async function performFullSync(
     if (!existingMap.has(file.slug)) {
       await execSql(client, dbId, `
         INSERT INTO wiki_index (slug, title, description, content_hash, content_vec, tags)
-        VALUES ('${escapeStr(file.slug)}', ${escapeSqlLiteral(pageTitle)}, ${escapeSqlLiteral(pageDesc)},
+        VALUES (${escapeSqlLiteral(file.slug)}, ${escapeSqlLiteral(pageTitle)}, ${escapeSqlLiteral(pageDesc)},
                 '${file.hash}', embedding(${embText})::vector(1024),
                 ${escapeArray(tags)})
       `);
       created++;
-    } else if (existingMap.get(file.slug) !== file.hash) {
+    } else if (forceRewrite || existingMap.get(file.slug) !== file.hash) {
       await execSql(client, dbId, `
         UPDATE wiki_index
         SET title = ${escapeSqlLiteral(pageTitle)},
@@ -503,7 +561,7 @@ async function performFullSync(
             content_vec = embedding(${embText})::vector(1024),
             tags = ${escapeArray(tags)},
             updated_at = NOW()
-        WHERE slug = '${escapeStr(file.slug)}'
+        WHERE slug = ${escapeSqlLiteral(file.slug)}
       `);
       updated++;
     } else {
@@ -511,15 +569,14 @@ async function performFullSync(
     }
   }
 
-  for (const [slug] of existingMap) {
-    if (!localSlugs.has(slug)) {
-      await execSql(client, dbId, `DELETE FROM wiki_index WHERE slug = '${escapeStr(slug)}'`);
-      deleted++;
-    }
+  for (const slug of deletionPlan.slugs) {
+    await deleteSql(client, dbId, `DELETE FROM wiki_index WHERE slug = ${escapeSqlLiteral(slug)}`,
+      [slug], "delete-index", record);
+    deleted++;
   }
   console.log(`Wiki index diff complete: ${created} created, ${updated} updated, ${deleted} deleted, ${unchanged} unchanged.`);
 
-  await syncPageSourceReferencesFull(client, dbId, pageSourceRows);
+  await syncPageSourceReferencesFull(client, dbId, pageSourceRows, record);
 
   console.log("Syncing to fs9...");
   const hasLogFile = await localLogExists(dir);
@@ -530,21 +587,25 @@ async function performFullSync(
         path: `/wiki/${file.path}`,
         size: file.size,
         mtimeMs: file.mtimeMs,
+        forceWrite: forceRewrite || state?.fileHashes[`wiki/${file.path}`] !== fileHashes[`wiki/${file.path}`],
         write: () => fsClient.writeFile(`/wiki/${file.path}`, file.content),
       }));
       const sourceSyncFiles: SyncableFile[] = sourceFiles.map((file) => ({
         path: `/sources/${file.path}`,
         size: file.size,
         mtimeMs: file.mtimeMs,
+        forceWrite: forceRewrite || state?.fileHashes[`sources/${file.path}`] !== fileHashes[`sources/${file.path}`],
         write: () => fsClient.writeFile(`/sources/${file.path}`, file.bytes),
       }));
       const logSyncFile = await buildLogSyncFile(dir, (path, content) => fsClient.writeFile(path, content));
+      if (logSyncFile) logSyncFile.forceWrite = forceRewrite || state?.fileHashes["log.md"] !== fileHashes["log.md"];
       const wikiFs9 = await syncFs9Files(wikiSyncFiles, "wiki files", "wiki files", (path) => fsClient.stat(path));
       const sourceFs9 = await syncFs9Files(sourceSyncFiles, "source files", "source files", (path) => fsClient.stat(path));
       const logFs9 = logSyncFile
         ? await syncFs9Files([logSyncFile], "log file", "log file", (path) => fsClient.stat(path))
         : { written: 0, skipped: 0 };
-      const removedFs9 = await removeFs9Paths(staleRemotePaths, "stale remote files", "stale remote files", (path) => fsClient.rm(path, false));
+      const removedFs9 = await removeFs9Paths(deletionPlan.paths, "stale remote files", "stale remote files",
+        (path) => fsClient.rm(path, false), record);
 
       console.log(
         `  fs9 sync complete (${wikiFs9.written + sourceFs9.written + logFs9.written} written, ${wikiFs9.skipped + sourceFs9.skipped + logFs9.skipped} skipped, ${removedFs9} removed)`,
@@ -552,8 +613,8 @@ async function performFullSync(
     } finally {
       await fsClient.close();
     }
-  } catch (err) {
-    throw new Error("File sync failed; local sync state was not advanced. Retry sync after resolving the error.", { cause: err });
+  } catch {
+    throw new Error("File sync failed; local sync state was not advanced. Retry sync after resolving the error.");
   }
 
   return { created, updated, deleted, unchanged, referencedSourcePaths, pageSourceRows, hasLogFile };
@@ -566,23 +627,14 @@ async function performLightweightSync(
   state: SyncState,
   wikiEntries: WikiPageEntry[],
   sourceEntries: SourceFileEntry[],
+  deletionPlan: DeletionPlan,
+  fileHashes: Record<string, string>,
+  record: OperationRecorder,
 ): Promise<{ created: number; updated: number; deleted: number; unchanged: number; referencedSourcePaths: Set<string>; pageSourceRows: PageSourceRow[]; hasLogFile: boolean }> {
-  const lastSyncMs = Date.parse(state.lastSuccessfulSyncAt);
-  if (Number.isNaN(lastSyncMs)) {
-    throw new Error("Stored sync state has an invalid timestamp. Re-run with `wiki9 sync --full` once to reset it.");
-  }
-
-  const currentWikiPaths = new Set(wikiEntries.map((entry) => entry.path));
-  const currentSourcePaths = new Set(sourceEntries.map((entry) => entry.path));
-  const previousWikiPaths = new Set(state.wikiPaths);
-  const previousSourcePaths = new Set(state.sourcePaths);
-  const changedWikiEntries = wikiEntries.filter((entry) => isEntryChanged(entry, lastSyncMs, previousWikiPaths));
-  const changedSourceEntries = sourceEntries.filter((entry) => isEntryChanged(entry, lastSyncMs, previousSourcePaths));
-  const deletedWikiPaths = state.wikiPaths.filter((path) => !currentWikiPaths.has(path));
-  const deletedWikiSlugs = state.wikiPaths
-    .filter((path) => !currentWikiPaths.has(path))
-    .map((path) => path.replace(/\.md$/, ""));
-  const deletedSourcePaths = state.sourcePaths.filter((path) => !currentSourcePaths.has(path));
+  const changedWikiEntries = wikiEntries.filter((entry) => state.fileHashes[`wiki/${entry.path}`] !== fileHashes[`wiki/${entry.path}`]);
+  const changedSourceEntries = sourceEntries.filter((entry) => state.fileHashes[`sources/${entry.path}`] !== fileHashes[`sources/${entry.path}`]);
+  const deletedWikiSlugs = deletionPlan.slugs;
+  const deletedSourcePaths = deletionPlan.paths.filter((path) => path.startsWith("/sources/"));
 
   console.log(
     `Using lightweight sync since ${state.lastSuccessfulSyncAt} (${changedWikiEntries.length} wiki pages changed, ${changedSourceEntries.length} source files changed, ${deletedWikiSlugs.length} wiki pages deleted, ${deletedSourcePaths.length} source files deleted).`,
@@ -627,7 +679,7 @@ async function performLightweightSync(
     if (!existingMap.has(file.slug)) {
       await execSql(client, dbId, `
         INSERT INTO wiki_index (slug, title, description, content_hash, content_vec, tags)
-        VALUES ('${escapeStr(file.slug)}', ${escapeSqlLiteral(pageTitle)}, ${escapeSqlLiteral(pageDesc)},
+        VALUES (${escapeSqlLiteral(file.slug)}, ${escapeSqlLiteral(pageTitle)}, ${escapeSqlLiteral(pageDesc)},
                 '${file.hash}', embedding(${embText})::vector(1024),
                 ${escapeArray(tags)})
       `);
@@ -641,20 +693,21 @@ async function performLightweightSync(
             content_vec = embedding(${embText})::vector(1024),
             tags = ${escapeArray(tags)},
             updated_at = NOW()
-        WHERE slug = '${escapeStr(file.slug)}'
+        WHERE slug = ${escapeSqlLiteral(file.slug)}
       `);
       updated++;
     }
   }
 
   if (deletedWikiSlugs.length > 0) {
-    await execSql(client, dbId, `DELETE FROM wiki_index WHERE slug IN (${escapeSqlList(deletedWikiSlugs)})`);
+    await deleteSql(client, dbId, `DELETE FROM wiki_index WHERE slug IN (${escapeSqlList(deletedWikiSlugs)})`,
+      deletedWikiSlugs, "delete-index", record);
     deleted = deletedWikiSlugs.length;
   }
   const unchanged = wikiEntries.length - created - updated;
   console.log(`Wiki index diff complete: ${created} created, ${updated} updated, ${deleted} deleted, ${unchanged} unchanged.`);
 
-  await syncPageSourceReferencesLightweight(client, dbId, pageSourceRows, affectedSlugs);
+  await syncPageSourceReferencesLightweight(client, dbId, pageSourceRows, affectedSlugs, record);
 
   console.log("Syncing to fs9...");
   const hasLogFile = await localLogExists(dir);
@@ -674,19 +727,15 @@ async function performLightweightSync(
         write: () => fsClient.writeFile(`/sources/${file.path}`, file.bytes),
       }));
       const actualLogSyncFile = await buildLogSyncFile(dir, (path, content) => fsClient.writeFile(path, content));
-      const changedLogSyncFile = actualLogSyncFile && (actualLogSyncFile.mtimeMs > lastSyncMs || !state.hasLogFile)
+      const changedLogSyncFile = actualLogSyncFile && state.fileHashes["log.md"] !== fileHashes["log.md"]
         ? [actualLogSyncFile]
         : [];
-      const deletedRemotePaths = [
-        ...deletedWikiPaths.map((path) => `/wiki/${path}`),
-        ...deletedSourcePaths.map((path) => `/sources/${path}`),
-        ...(state.hasLogFile && !hasLogFile ? ["/log.md"] : []),
-      ];
 
       const wikiFs9 = await syncFs9Files(wikiSyncFiles, "wiki files", "wiki files");
       const sourceFs9 = await syncFs9Files(sourceSyncFiles, "source files", "source files");
       const logFs9 = await syncFs9Files(changedLogSyncFile, "log file", "log file");
-      const removedFs9 = await removeFs9Paths(deletedRemotePaths, "deleted local files", "deleted local files", (path) => fsClient.rm(path, false));
+      const removedFs9 = await removeFs9Paths(deletionPlan.paths, "deleted local files", "deleted local files",
+        (path) => fsClient.rm(path, false), record);
 
       console.log(
         `  fs9 sync complete (${wikiFs9.written + sourceFs9.written + logFs9.written} written, ${wikiFs9.skipped + sourceFs9.skipped + logFs9.skipped} skipped, ${removedFs9} removed)`,
@@ -694,8 +743,8 @@ async function performLightweightSync(
     } finally {
       await fsClient.close();
     }
-  } catch (err) {
-    throw new Error("File sync failed; local sync state was not advanced. Retry sync after resolving the error.", { cause: err });
+  } catch {
+    throw new Error("File sync failed; local sync state was not advanced. Retry sync after resolving the error.");
   }
 
   return { created, updated, deleted, unchanged, referencedSourcePaths, pageSourceRows, hasLogFile };
@@ -703,8 +752,22 @@ async function performLightweightSync(
 
 export async function syncCommand(options: SyncOptions = {}) {
   if (options.prune && !options.full) throw new Error("--prune requires --full");
-  const startedAt = new Date().toISOString();
   const config = await loadConfig();
+  const record = operationRecorder(process.cwd(), config.db9.database);
+  await record({ operation: "sync", outcome: "started" });
+  try {
+    await synchronize(options, config, record);
+    await record({ operation: "sync", outcome: "succeeded" });
+  } catch (error) {
+    await record({ operation: "sync", outcome: "failed" });
+    throw error;
+  }
+}
+
+async function synchronize(
+  options: SyncOptions, config: Awaited<ReturnType<typeof loadConfig>>, record: OperationRecorder,
+) {
+  const startedAt = new Date().toISOString();
   const client = createClient(config);
   const dbId = config.db9.database;
   const dir = process.cwd();
@@ -723,31 +786,49 @@ export async function syncCommand(options: SyncOptions = {}) {
   const sourceEntries = await collectSourceFileEntries(sourcesDir);
   const hasLogFile = await localLogExists(dir);
   console.log(`Collected ${wikiEntries.length} wiki pages and ${sourceEntries.length} source files.`);
+  const fileHashes = await collectLocalHashes(dir, wikiEntries, sourceEntries, hasLogFile);
 
   const state = await loadSyncState(dir, dbId);
-  await initSchema(client, dbId);
+  await record({ operation: "schema", outcome: "started" });
+  try {
+    await initSchema(client, dbId);
+  } catch (error) {
+    await record({ operation: "schema", outcome: "failed" });
+    throw error;
+  }
+  await record({ operation: "schema", outcome: "succeeded" });
   const remote = await inspectRemote(client, dbId);
-  if (state && remote.snapshot !== state.remoteSnapshot && !options.prune) {
+  const snapshot = state?.version === 2 ? remote.legacySnapshot : remote.snapshot;
+  if (state && snapshot !== state.remoteSnapshot && !options.prune) {
     throw new Error("Remote data changed since this directory last synced. Restore and merge changes in a separate directory before syncing, or explicitly review `wiki9 sync --full --prune` to replace remote data.");
+  }
+  const deletionPlan = requirePruneApproval(remote, state, wikiEntries, sourceEntries, hasLogFile, !!options.prune);
+  const targets = [...deletionPlan.slugs.map((slug) => `index: ${slug}`), ...deletionPlan.paths];
+  if (targets.length > 0) {
+    console.log(`Remote deletion plan (${targets.length} targets):`);
+    for (const target of targets) console.log(`  ${displayText(target)}`);
+    await record({ operation: "sync", outcome: "planned", targets });
   }
   let result;
   if (options.full) {
-    const stalePaths = requirePruneApproval(remote, state, wikiEntries, sourceEntries, hasLogFile, !!options.prune);
     console.log("Running full sync...");
-    result = await performFullSync(client, dbId, dir, wikiEntries, sourceEntries, stalePaths);
+    if (options.prune) console.log("Explicit rebuild: replacing remote index entries, vectors and files with local content.");
+    result = await performFullSync(client, dbId, dir, wikiEntries, sourceEntries,
+      deletionPlan, state, fileHashes, !!options.prune, record);
   } else {
     if (!state) {
-      const stalePaths = requirePruneApproval(remote, state, wikiEntries, sourceEntries, hasLogFile, false);
       console.log("No previous successful sync state found; running full sync without implicit remote pruning.");
-      result = await performFullSync(client, dbId, dir, wikiEntries, sourceEntries, stalePaths);
+      result = await performFullSync(client, dbId, dir, wikiEntries, sourceEntries,
+        deletionPlan, state, fileHashes, false, record);
     } else {
-      result = await performLightweightSync(client, dbId, dir, state, wikiEntries, sourceEntries);
+      result = await performLightweightSync(client, dbId, dir, state, wikiEntries, sourceEntries,
+        deletionPlan, fileHashes, record);
     }
   }
 
   const after = await inspectRemote(client, dbId);
-  await saveSyncState(dir, wikiEntries, sourceEntries, result.hasLogFile, dbId, startedAt, after.snapshot);
-  console.log(`Saved sync state to ${syncStatePath(dir)}.`);
+  await saveSyncState(dir, wikiEntries, sourceEntries, result.hasLogFile, dbId, startedAt, after.snapshot, fileHashes);
+  console.log(`Saved sync state to ${displayText(syncStatePath(dir))}.`);
 
   console.log("\nSync complete:");
   console.log(`  wiki:    ${result.created} created, ${result.updated} updated, ${result.deleted} deleted, ${result.unchanged} unchanged`);
