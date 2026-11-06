@@ -25,8 +25,7 @@ CREATE TABLE IF NOT EXISTS wiki_page_sources (
 );
 `;
 
-// HNSW index created separately (fails silently if exists)
-const INDEX_SQL = `CREATE INDEX idx_wiki_vec ON wiki_index USING hnsw (content_vec vector_cosine_ops);`;
+const INDEX_SQL = `CREATE INDEX IF NOT EXISTS idx_wiki_vec ON wiki_index USING hnsw (content_vec vector_cosine_ops);`;
 const PAGE_SOURCES_INDEX_SQL = `CREATE INDEX IF NOT EXISTS idx_wiki_page_sources_source_path ON wiki_page_sources (source_path);`;
 
 export function createClient(config: WikiConfig): Db9Client {
@@ -46,12 +45,15 @@ export async function initSchema(client: Db9Client, dbId: string): Promise<void>
   if (result.error) {
     throw backendError("Schema init failed", result.error);
   }
-  // Try creating HNSW index, ignore if already exists
-  try {
-    await client.databases.sql(dbId, INDEX_SQL);
-    await client.databases.sql(dbId, PAGE_SOURCES_INDEX_SQL);
-  } catch (error) {
-    throw backendError("Index initialization failed", error);
+  for (const sql of [INDEX_SQL, PAGE_SOURCES_INDEX_SQL]) {
+    try {
+      result = await client.databases.sql(dbId, sql);
+    } catch (error) {
+      throw backendError("Index initialization failed", error);
+    }
+    if (result.error) {
+      throw backendError("Index initialization failed", result.error);
+    }
   }
 }
 
