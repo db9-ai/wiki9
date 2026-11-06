@@ -26,21 +26,21 @@ async function ensureSymlink(path: string, target: string) {
   try {
     const stat = await lstat(path);
     if (!stat.isSymbolicLink()) {
-      console.log(`  skip ${path} (exists and is not a symlink)`);
+      console.log(`  skip ${displayText(path)} (exists and is not a symlink)`);
       return;
     }
 
     const existingTarget = await readlink(path);
     if (existingTarget === target) {
-      console.log(`  skip ${path} (symlink exists)`);
+      console.log(`  skip ${displayText(path)} (symlink exists)`);
       return;
     }
 
-    console.log(`  skip ${path} (points to ${existingTarget})`);
+    console.log(`  skip ${displayText(path)} (points to ${displayText(existingTarget)})`);
   } catch (error) {
     if (!isNotFound(error)) throw error;
     await symlink(target, path, "dir");
-    console.log(`  create ${path} -> ${target}`);
+    console.log(`  create ${displayText(path)} -> ${displayText(target)}`);
   }
 }
 
