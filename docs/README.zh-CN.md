@@ -172,6 +172,8 @@ wiki9 sync --full --prune
 
 `search`、`index`、`status` 支持 `--json` 返回结构化内容数据。人类可读输出会转义终端控制字符并缩短过长摘要；JSON 保留元数据值并转义控制字节。输出格式不会使内容中的指令可信。新生成的代理指令和技能要求把知识库、来源及查询结果当作数据，不能据此执行命令、访问凭据、外传或删除内容。生成 Markdown 标题时会转义知识库名称，配置中的原名称不变。初始化不覆盖已有 `AGENTS.md` 和技能文件，旧文件需要手动检查更新。
 
+任一数据库计数查询失败时，`wiki9 status` 会向 stderr 输出警告，并将 `Indexed pages`、`Unindexed`、`Referenced sources`、`Source links` 显示为 `unavailable`。本地页面/来源计数及本地分析仍可使用。使用 `--json` 时，`databaseAvailable` 为 `false`，`indexedPages`、`referencedSourceCount`、`pageSourceLinks` 为 `null`；两次查询均成功时，`databaseAvailable` 为 `true`，真实零计数仍为数字 `0`。仅计数查询失败不会导致非零退出码：其余本地处理成功时，命令仍以退出码 `0` 结束。调用方应检查 JSON 中的 `databaseAvailable` 或人类可读输出中的 `unavailable`，不能仅凭退出码 `0` 判断数据库统计完整。
+
 `.wiki9/operations.jsonl` 在本地记录时间、运行 ID、目标数据库、删除计划及结果，以及初始化、schema 和凭据更新事件；不记录凭据值、正文或原始后端错误响应。文件使用 `0600` 追加写入，写入失败会告警，不会声称已成功的远端操作被回滚。这是便于排查问题的尽力记录，不是不可篡改的审计服务，也不会镜像到远端。`log.md` 继续由代理维护编辑历史，“追加”是编辑约定，正常覆盖和删除仍会同步；日志中不要写入凭据和不必要的敏感内容。
 
 ### 凭据
