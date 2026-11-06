@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { stringify } from "smol-toml";
@@ -510,6 +510,54 @@ describe("initialization and credentials", () => {
     await initCommand("test-db", "replacement");
     expect((await loadConfig()).db9.token).toBe("replacement");
     expect((await loadConfig()).wiki.name).toBe(name);
+  });
+  it.each(
+    (["new", "matching", "different", "non-link"] as const).flatMap((branch) =>
+      [false, true].map((controls) => ({ branch, controls }))),
+  )("safely logs the $branch skills branch with controls=$controls without changing its behavior", async ({ branch, controls }) => {
+    const workspaceName = controls ? "workspace\n\u001b[2J" : "workspace";
+    const workspace = join(dir, workspaceName);
+    await mkdir(join(workspace, ".claude"), { recursive: true });
+    await writeFile(join(workspace, "wiki9.toml"), stringify(config));
+    vi.mocked(process.cwd).mockReturnValue(workspace);
+
+    const linkPath = join(workspace, ".claude", "skills");
+    const customTarget = controls ? "custom\n\u001b[2J\t\u009b\u202e" : "custom-skills";
+    const linkTarget = branch === "different" ? customTarget : "../.agents/skills";
+    if (branch === "non-link") await writeFile(linkPath, "Existing skills");
+    else if (branch !== "new") await symlink(linkTarget, linkPath, "dir");
+
+    await initCommand("test-db", undefined);
+
+    const renderedWorkspace = controls ? `${dir}/workspace\\n\\u001b[2J` : workspace;
+    const renderedPath = `${renderedWorkspace}/.claude/skills`;
+    const renderedTarget = controls ? "custom\\n\\u001b[2J\\t\\u009b\\u202e" : customTarget;
+    const expected = {
+      new: `  create ${renderedPath} -> ../.agents/skills`,
+      matching: `  skip ${renderedPath} (symlink exists)`,
+      different: `  skip ${renderedPath} (points to ${renderedTarget})`,
+      "non-link": `  skip ${renderedPath} (exists and is not a symlink)`,
+    }[branch];
+    expect(console.log).toHaveBeenCalledWith(expected);
+    if (branch === "non-link") {
+      expect((await lstat(linkPath)).isFile()).toBe(true);
+      expect(await readFile(linkPath, "utf-8")).toBe("Existing skills");
+    } else {
+      expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
+      expect(await readlink(linkPath)).toBe(linkTarget);
+    }
+  });
+  it("bounds a long existing skills target only in the log", async () => {
+    await mkdir(join(dir, ".claude"));
+    const linkPath = join(dir, ".claude", "skills");
+    const target = "custom-".repeat(100);
+    await symlink(target, linkPath, "dir");
+
+    await initCommand("test-db", undefined);
+
+    expect(console.log).toHaveBeenCalledWith(`  skip ${linkPath} (points to ${target.slice(0, 500)}…)`);
+    expect(await readlink(linkPath)).toBe(target);
+    expect((await lstat(linkPath)).isSymbolicLink()).toBe(true);
   });
   it("uses login credentials when no token is configured", async () => {
     await unlink(join(dir, "wiki9.toml"));
