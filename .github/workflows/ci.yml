@@ -20,4 +20,4 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
-      - run: npx vitest run test/safety.test.ts
+      - run: npx vitest run test/safety.test.ts test/output.test.ts test/errors.test.ts

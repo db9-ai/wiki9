@@ -22,7 +22,7 @@ export function isNotFound(error: unknown): boolean {
   return (error as NodeJS.ErrnoException)?.code === "ENOENT";
 }
 
-export async function ensureSafeDirectory(root: string, path: string, create = false): Promise<void> {
+export async function ensureSafeDirectory(root: string, path: string, create = false, mode = 0o755): Promise<void> {
   const base = resolve(root);
   const rel = relative(base, resolve(path));
   if (rel && !isRelativeFilePath(rel)) throw new Error("Local path escapes project directory");
@@ -31,7 +31,7 @@ export async function ensureSafeDirectory(root: string, path: string, create = f
   for (const dir of paths) {
     if (create) {
       try {
-        await mkdir(dir);
+        await mkdir(dir, { mode });
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
@@ -41,11 +41,21 @@ export async function ensureSafeDirectory(root: string, path: string, create = f
   }
 }
 
-export async function readSafeFile(root: string, path: string): Promise<Buffer> {
+export async function openSafeFile(root: string, path: string) {
   await ensureSafeDirectory(root, dirname(path));
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     if (!(await file.stat()).isFile()) throw new Error(`Not a regular file: ${path}`);
+    return file;
+  } catch (error) {
+    await file.close();
+    throw error;
+  }
+}
+
+export async function readSafeFile(root: string, path: string): Promise<Buffer> {
+  const file = await openSafeFile(root, path);
+  try {
     return await file.readFile();
   } finally {
     await file.close();
@@ -55,7 +65,7 @@ export async function readSafeFile(root: string, path: string): Promise<Buffer> 
 export async function writeSafeFileIfMissing(
   root: string, path: string, content: string | Uint8Array, mode = 0o644,
 ): Promise<boolean> {
-  await ensureSafeDirectory(root, dirname(path), true);
+  await ensureSafeDirectory(root, dirname(path), true, mode === 0o600 ? 0o700 : 0o755);
   try {
     const file = await open(path, "wx", mode);
     try {

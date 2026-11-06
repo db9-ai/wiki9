@@ -1,7 +1,7 @@
 import { readdir, lstat } from "node:fs/promises";
 import { basename, extname, join, relative, resolve } from "node:path";
 import { contentHash } from "./hash.js";
-import { ensureSafeDirectory, readSafeFile } from "./paths.js";
+import { ensureSafeDirectory, isRelativeFilePath, readSafeFile } from "./paths.js";
 
 export interface WikiPageFile {
   fullPath: string;
@@ -59,6 +59,8 @@ export async function collectWikiPageEntries(dir: string, base: string = dir): P
 
   for (const item of items) {
     const full = join(dir, item);
+    const rel = relative(base, full);
+    if (!isRelativeFilePath(rel)) throw new Error(`Unsupported local path; rename it before syncing: ${JSON.stringify(rel)}`);
     const s = await lstat(full);
     if (s.isSymbolicLink() || (!s.isDirectory() && !s.isFile())) {
       throw new Error(`Cannot sync a symlink or special file: ${full}`);
@@ -69,7 +71,6 @@ export async function collectWikiPageEntries(dir: string, base: string = dir): P
     }
     if (extname(item) !== ".md") continue;
 
-    const rel = relative(base, full);
     const slug = rel.replace(/\.md$/, "");
     entries.push({
       fullPath: full,
@@ -91,6 +92,8 @@ export async function collectSourceFileEntries(dir: string, base: string = dir):
 
   for (const item of items) {
     const full = join(dir, item);
+    const rel = relative(base, full);
+    if (!isRelativeFilePath(rel)) throw new Error(`Unsupported local path; rename it before syncing: ${JSON.stringify(rel)}`);
     const s = await lstat(full);
     if (s.isSymbolicLink() || (!s.isDirectory() && !s.isFile())) {
       throw new Error(`Cannot sync a symlink or special file: ${full}`);
@@ -101,7 +104,7 @@ export async function collectSourceFileEntries(dir: string, base: string = dir):
     }
     entries.push({
       fullPath: full,
-      path: relative(base, full),
+      path: rel,
       size: s.size,
       mtimeMs: s.mtimeMs,
     });
@@ -168,6 +171,9 @@ export function parseFrontmatter(content: string): FrontmatterData {
       .filter(Boolean)
       .map(normalizeSourceRef)
     : [];
+  for (const source of sources) {
+    if (!isRelativeFilePath(source)) throw new Error(`Unsupported source reference: ${JSON.stringify(source)}`);
+  }
 
   return { title, description, tags, sources };
 }

@@ -10,14 +10,16 @@ import { createClient, initSchema } from "../db.js";
 import { loadConfig, type WikiConfig } from "../config.js";
 import type { Db9Client } from "get-db9";
 import { ensureSafeDirectory, isNotFound, readSafeFile, remoteChildPath, writeSafeFileIfMissing } from "../utils/paths.js";
+import { displayText } from "../utils/output.js";
+import { operationRecorder, type OperationRecorder } from "../utils/operations.js";
 
 async function ensureDir(path: string) {
-  await ensureSafeDirectory(process.cwd(), path, true);
+  await ensureSafeDirectory(process.cwd(), path, true, 0o700);
 }
 
-async function writeIfMissing(path: string, content: string) {
-  const created = await writeSafeFileIfMissing(process.cwd(), path, content);
-  console.log(`  ${created ? "create" : "skip"} ${path}${created ? "" : " (exists)"}`);
+async function writeIfMissing(path: string, content: string, mode = 0o644) {
+  const created = await writeSafeFileIfMissing(process.cwd(), path, content, mode);
+  console.log(`  ${created ? "create" : "skip"} ${displayText(path)}${created ? "" : " (exists)"}`);
 }
 
 async function ensureSymlink(path: string, target: string) {
@@ -43,8 +45,8 @@ async function ensureSymlink(path: string, target: string) {
 }
 
 async function writeBinaryIfMissing(path: string, content: Uint8Array) {
-  const created = await writeSafeFileIfMissing(process.cwd(), path, content);
-  console.log(`  ${created ? "create" : "skip"} ${path}${created ? "" : " (exists)"}`);
+  const created = await writeSafeFileIfMissing(process.cwd(), path, content, 0o600);
+  console.log(`  ${created ? "create" : "skip"} ${displayText(path)}${created ? "" : " (exists)"}`);
 }
 
 async function pullRemoteTree(client: Db9Client, dbId: string, dir: string, remotePath: string): Promise<number> {
@@ -84,7 +86,22 @@ async function pullRemoteFile(client: Db9Client, dbId: string, dir: string, remo
 }
 
 export async function initCommand(db: string, token: string | undefined, name?: string) {
+  const record = operationRecorder(process.cwd(), db);
+  await record({ operation: "init", outcome: "started" });
+  try {
+    await initialize(db, token, name, record);
+    await record({ operation: "init", outcome: "succeeded" });
+  } catch (error) {
+    await record({ operation: "init", outcome: "failed" });
+    throw error;
+  }
+}
+
+async function initialize(db: string, token: string | undefined, name: string | undefined, record: OperationRecorder) {
   const dir = process.cwd();
+  if (token !== undefined) {
+    console.error("Warning: --token may expose credentials in shell history or process arguments and saves them in wiki9.toml. Prefer WIKI9_TOKEN or db9 login.");
+  }
   const configPath = join(dir, "wiki9.toml");
   let previous: WikiConfig | undefined;
   try {
@@ -103,7 +120,7 @@ export async function initCommand(db: string, token: string | undefined, name?: 
     search: { top_k: previous?.search?.top_k ?? 5 },
   };
 
-  console.log(`Initializing wiki9 in ${dir}...\n`);
+  console.log(`Initializing wiki9 in ${displayText(dir)}...\n`);
 
   // Create directories
   for (const sub of ["wiki", "sources", ".agents/skills", ".claude"]) {
@@ -126,6 +143,15 @@ export async function initCommand(db: string, token: string | undefined, name?: 
     console.log("  update wiki9.toml");
   } else {
     console.log("  create wiki9.toml");
+  }
+  if (!previous || token !== undefined) {
+    await record({
+      operation: "credential-update",
+      outcome: "succeeded",
+      credentialSource: token !== undefined ? "argument"
+        : process.env.WIKI9_TOKEN ? "environment"
+        : config.db9.token ? "configuration" : "login",
+    });
   }
 
   // Write .gitignore entry for config (contains credentials)
@@ -169,7 +195,14 @@ export async function initCommand(db: string, token: string | undefined, name?: 
   try {
     const runtimeConfig = await loadConfig(dir, token === undefined);
     const client = createClient(runtimeConfig);
-    await initSchema(client, db);
+    await record({ operation: "schema", outcome: "started" });
+    try {
+      await initSchema(client, db);
+    } catch (error) {
+      await record({ operation: "schema", outcome: "failed" });
+      throw error;
+    }
+    await record({ operation: "schema", outcome: "succeeded" });
     console.log(`  DB9 schema initialized`);
 
     console.log(`\nPulling remote wiki data...`);
@@ -177,12 +210,12 @@ export async function initCommand(db: string, token: string | undefined, name?: 
     const pulledSources = await pullRemoteTree(client, db, dir, "/sources");
     const pulledLog = await pullRemoteFile(client, db, dir, "/log.md");
     console.log(`  pulled ${pulledWiki} wiki files, ${pulledSources} source files${pulledLog ? ", 1 log file" : ""}`);
-  } catch (err) {
-    throw new Error("Initialization or remote restore failed. Retry `wiki9 init` before syncing.", { cause: err });
+  } catch {
+    throw new Error("Initialization or remote restore failed. Retry `wiki9 init` before syncing.");
   }
 
   // Write log.md
-  await writeIfMissing(join(dir, "log.md"), "# Wiki Log\n");
+  await writeIfMissing(join(dir, "log.md"), "# Wiki Log\n", 0o600);
   await unlink(restoreMarker);
 
   console.log(`\nDone! Open this directory with your AI agent to get started.`);
