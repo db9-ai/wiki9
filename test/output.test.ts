@@ -10,11 +10,13 @@ import { searchCommand } from "../src/commands/search.js";
 import { indexCommand } from "../src/commands/index.js";
 import { statusCommand } from "../src/commands/status.js";
 
-const responses = vi.hoisted(() => ({ rows: [] as unknown[][], unavailable: false }));
+const responses = vi.hoisted(() => ({ rows: [] as unknown[][], unavailable: false, unavailableSources: false }));
 vi.mock("../src/db.js", () => ({
   createClient: vi.fn(() => ({})),
-  execSql: vi.fn(async () => {
-    if (responses.unavailable) throw new Error("SECRET backend payload");
+  execSql: vi.fn(async (_client: unknown, _database: string, query: string) => {
+    if (responses.unavailable || (responses.unavailableSources && query.includes("wiki_page_sources"))) {
+      throw new Error("SECRET backend payload");
+    }
     return { rows: responses.rows };
   }),
 }));
@@ -35,7 +37,7 @@ beforeEach(async () => {
   }));
   await mkdir(join(directory, "wiki"));
   await mkdir(join(directory, "sources"));
-  responses.rows = []; responses.unavailable = false;
+  responses.rows = []; responses.unavailable = false; responses.unavailableSources = false;
 });
 
 afterEach(async () => {
@@ -113,13 +115,82 @@ describe("output boundaries", () => {
     expect(logOutput()).not.toContain("Wiki: Wiki\n## fake instruction");
   });
 
-  it("reports unavailable database counts in structured status without exposing backend errors", async () => {
-    responses.unavailable = true;
-    await statusCommand({ json: true });
+  it.each(["pages", "sources"])("shows unavailable human counts when the %s query fails", async (query) => {
+    responses.rows = [[8, 12]];
+    responses.unavailable = query === "pages";
+    responses.unavailableSources = query === "sources";
+    await writeFile(join(directory, "wiki", "topic.md"), "---\nsources: [used.txt]\n---\n# Topic");
+    await writeFile(join(directory, "sources", "used.txt"), "Used source");
+    await writeFile(join(directory, "sources", "unused.txt"), "Unused source");
+
+    await expect(statusCommand()).resolves.toBeUndefined();
+
+    const output = logOutput();
+    expect(output).toContain("Indexed pages:  unavailable");
+    expect(output).toContain("Unindexed:      unavailable");
+    expect(output).toContain("Referenced sources: unavailable");
+    expect(output).toContain("Source links:   unavailable");
+    expect(output).toContain("Local pages:    1");
+    expect(output).toContain("Local sources:  2");
+    expect(output).toContain("Unreferenced source files:\n  - unused.txt");
+    expect(output).not.toContain("  - used.txt");
+    expect(vi.mocked(console.error).mock.calls).toEqual([
+      ["DB9 query failed; database counts are unavailable."],
+    ]);
+  });
+
+  it.each([0, 1])("keeps real zero database counts with %i local pages", async (localPages) => {
+    responses.rows = [[0, 0]];
+    if (localPages > 0) await writeFile(join(directory, "wiki", "topic.md"), "# Topic");
+
+    await expect(statusCommand()).resolves.toBeUndefined();
+
+    const output = logOutput();
+    expect(output).toContain("Indexed pages:  0");
+    expect(output).toContain(`Unindexed:      ${localPages}`);
+    expect(output).toContain("Referenced sources: 0");
+    expect(output).toContain("Source links:   0");
+    expect(output).toContain(`Local pages:    ${localPages}`);
+    expect(output).toContain("Local sources:  0");
+    expect(output).not.toContain("unavailable");
+    expect(console.error).not.toHaveBeenCalled();
+  });
+
+  it("keeps available nonzero database counts and clamps unindexed pages", async () => {
+    responses.rows = [[3, 7]];
+    await writeFile(join(directory, "wiki", "topic.md"), "# Topic");
+
+    await statusCommand();
+
+    expect(logOutput()).toContain("Indexed pages:  3");
+    expect(logOutput()).toContain("Unindexed:      0");
+    expect(logOutput()).toContain("Referenced sources: 3");
+    expect(logOutput()).toContain("Source links:   7");
+  });
+
+  it.each(["pages", "sources"])("keeps structured counts null when the %s query fails", async (query) => {
+    responses.rows = [[8, 12]];
+    responses.unavailable = query === "pages";
+    responses.unavailableSources = query === "sources";
+    await writeFile(join(directory, "wiki", "topic.md"), "# Topic");
+
+    await expect(statusCommand({ json: true })).resolves.toBeUndefined();
+
     expect(JSON.parse(logOutput())).toMatchObject({
       kind: "wiki9.status", untrusted: true, databaseAvailable: false,
+      localPages: 1, localSources: 0,
       indexedPages: null, referencedSourceCount: null, pageSourceLinks: null,
     });
     expect(vi.mocked(console.error).mock.calls.flat().join("\n")).not.toContain("SECRET");
+  });
+
+  it("keeps real zero database counts numeric in structured status", async () => {
+    responses.rows = [[0, 0]];
+    await statusCommand({ json: true });
+    expect(JSON.parse(logOutput())).toMatchObject({
+      kind: "wiki9.status", untrusted: true, databaseAvailable: true,
+      localPages: 0, localSources: 0,
+      indexedPages: 0, referencedSourceCount: 0, pageSourceLinks: 0,
+    });
   });
 });
