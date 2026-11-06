@@ -38,3 +38,53 @@ describe("backend error redaction", () => {
       .rejects.not.toThrow("SECRET");
   });
 });
+
+describe("index initialization", () => {
+  it("completes both index requests on repeated initialization", async () => {
+    const sql = vi.fn().mockResolvedValue({ error: null });
+    const client = { databases: { sql } } as never;
+    await initSchema(client, "test-db");
+    await initSchema(client, "test-db");
+    expect(sql).toHaveBeenCalledTimes(6);
+  });
+
+  it.each([
+    [1, "42501"],
+    [2, "42501"],
+    [1, "42601"],
+    [2, "42601"],
+    [1, "42P07"],
+    [2, "42P07"],
+  ])("rejects response errors at request %i with code %s", async (failedRequest, code) => {
+    const sql = vi.fn().mockResolvedValue({ error: null });
+    for (let request = 0; request < failedRequest; request++) {
+      sql.mockResolvedValueOnce({ error: null });
+    }
+    sql.mockResolvedValueOnce({
+      error: { code, message: "SECRET SQL and credentials", details: { token: "SECRET" } },
+    });
+    const failure = initSchema({ databases: { sql } } as never, "test-db");
+    await expect(failure).rejects.toThrow(`Index initialization failed (code ${code})`);
+    await expect(failure).rejects.not.toThrow("SECRET");
+    expect(sql).toHaveBeenCalledTimes(failedRequest + 1);
+  });
+
+  it.each([1, 2])("redacts transport errors at index request %i", async (failedRequest) => {
+    const sql = vi.fn().mockResolvedValue({ error: null });
+    for (let request = 0; request < failedRequest; request++) {
+      sql.mockResolvedValueOnce({ error: null });
+    }
+    sql.mockRejectedValueOnce(Object.assign(
+      new Error("Bearer SECRET"),
+      { status: 403, cause: { token: "SECRET" } },
+    ));
+    try {
+      await initSchema({ databases: { sql } } as never, "test-db");
+      expect.fail("expected index initialization to fail");
+    } catch (error) {
+      expect(String(error)).toBe("Error: Index initialization failed (HTTP 403)");
+      expect((error as Error).cause).toBeUndefined();
+    }
+    expect(sql).toHaveBeenCalledTimes(failedRequest + 1);
+  });
+});
