@@ -89,12 +89,12 @@ export async function statusCommand(options: OutputOptions = {}) {
   console.log(`DB9:  ${displayText(config.db9.database)}`);
   console.log();
   console.log(`Local pages:    ${localPages}`);
-  console.log(`Indexed pages:  ${indexedPages}`);
-  console.log(`Unindexed:      ${Math.max(0, localPages - indexedPages)}`);
+  console.log(`Indexed pages:  ${databaseAvailable ? indexedPages : "unavailable"}`);
+  console.log(`Unindexed:      ${databaseAvailable ? Math.max(0, localPages - indexedPages) : "unavailable"}`);
   console.log();
   console.log(`Local sources:  ${localSources}`);
-  console.log(`Referenced sources: ${referencedSourceCount}`);
-  console.log(`Source links:   ${pageSourceLinks}`);
+  console.log(`Referenced sources: ${databaseAvailable ? referencedSourceCount : "unavailable"}`);
+  console.log(`Source links:   ${databaseAvailable ? pageSourceLinks : "unavailable"}`);
 
   console.log();
   if (duplicateGroups.length === 0) {
