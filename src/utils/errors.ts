@@ -1,3 +1,9 @@
+class BackendError extends Error {}
+
+export function isBackendError(error: unknown): error is Error {
+  return error instanceof BackendError;
+}
+
 export function backendError(context: string, error: unknown): Error {
   const details = error && typeof error === "object"
     ? error as { code?: unknown; status?: unknown; sqlstate?: unknown }
@@ -10,5 +16,5 @@ export function backendError(context: string, error: unknown): Error {
     && details.status >= 400 && details.status <= 599
     ? ` (HTTP ${details.status})`
     : "";
-  return new Error(`${context}${state}${status}`);
+  return new BackendError(`${context}${state}${status}`);
 }

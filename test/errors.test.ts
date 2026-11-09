@@ -1,7 +1,37 @@
 import { describe, expect, it, vi } from "vitest";
 import { execSql, initSchema } from "../src/db.js";
+import { backendError, isBackendError } from "../src/utils/errors.js";
 
 describe("backend error redaction", () => {
+  it("identifies only internally redacted errors without changing their Error presentation", () => {
+    const error = backendError("Schema init failed", {
+      code: "42501", status: 403, message: "SECRET", details: "SECRET", cause: new Error("SECRET"),
+    });
+    expect(isBackendError(error)).toBe(true);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.name).toBe("Error");
+    expect(String(error)).toBe("Error: Schema init failed (code 42501) (HTTP 403)");
+    expect(error.cause).toBeUndefined();
+    expect(Object.keys(error)).toEqual([]);
+    expect(isBackendError(new Error("Schema init failed (code 42501)"))).toBe(false);
+    expect(isBackendError(Object.assign(new Error("SECRET"), { name: "BackendError" }))).toBe(false);
+    expect(isBackendError({ name: "BackendError", message: error.message })).toBe(false);
+    expect(isBackendError(null)).toBe(false);
+  });
+
+  it.each([
+    { code: "42501 SECRET", status: 399 },
+    { sqlstate: "\u001b[31m", code: "42501", status: 600 },
+    { code: "abcde", status: 403.5 },
+    { code: 42501, status: "403" },
+    null,
+  ])("does not expand the accepted backend fields for %j", (details) => {
+    const error = backendError("Schema init failed", details);
+    expect(isBackendError(error)).toBe(true);
+    expect(error.message).toBe("Schema init failed");
+    expect(error.cause).toBeUndefined();
+  });
+
   it("retains SQLSTATE but omits backend messages, details and nested credentials", async () => {
     const sql = vi.fn(async () => ({
       error: { code: "42501", message: "SECRET token", details: { token: "SECRET" } },
