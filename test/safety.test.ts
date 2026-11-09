@@ -9,7 +9,8 @@ import { initCommand } from "../src/commands/init.js";
 import { collectSourceFiles, collectWikiPages } from "../src/utils/wiki.js";
 import { remoteChildPath, writeSafeFileIfMissing } from "../src/utils/paths.js";
 import { contentHash, fileHash } from "../src/utils/hash.js";
-import { createClient } from "../src/db.js";
+import { createClient, initSchema } from "../src/db.js";
+import { backendError } from "../src/utils/errors.js";
 
 vi.mock("node:fs/promises", async (original) => {
   const fs = await original<typeof import("node:fs/promises")>();
@@ -625,5 +626,77 @@ describe("initialization and credentials", () => {
     await writeFile(join(dir, "wiki9.toml"), '[db9]\ntoken = "SECRET" invalid\n');
     await expect(loadConfig()).rejects.toThrow("Invalid wiki9.toml: cannot parse TOML");
     await expect(loadConfig()).rejects.not.toThrow(/SECRET/);
+  });
+});
+
+describe("initialization error diagnostics", () => {
+  const retryMessage = "Initialization or remote restore failed. Retry `wiki9 init` before syncing.";
+  const secret = "SECRET SQL and credentials\n\u001b[31m";
+
+  it.each([
+    [0, "42501"], [1, "42501"], [2, "42501"],
+    [0, "42601"], [1, "42601"], [2, "42601"],
+    [0, "HTTP"], [1, "HTTP"], [2, "HTTP"],
+  ] as const)("preserves safe diagnostics at request %i for %s", async (failedRequest, code) => {
+    const actual = await vi.importActual<typeof import("../src/db.js")>("../src/db.js");
+    const sql = vi.fn().mockResolvedValue({ error: null });
+    for (let request = 0; request < failedRequest; request++) {
+      sql.mockResolvedValueOnce({ error: null });
+    }
+    if (code === "HTTP") {
+      sql.mockRejectedValueOnce(Object.assign(new Error(secret), { status: 403, cause: { token: secret } }));
+    } else {
+      sql.mockResolvedValueOnce({ error: { code, message: secret, details: { token: secret } } });
+    }
+    vi.mocked(initSchema).mockImplementationOnce(() => actual.initSchema({ databases: { sql } } as never, "test-db"));
+    const restoreCalls = vi.mocked(client.fs.exists).mock.calls.length;
+    const failure = await initCommand("test-db", undefined).catch((error: unknown) => error);
+    const stage = failedRequest === 0 ? "Schema init failed" : "Index initialization failed";
+    const state = code === "HTTP" ? " (HTTP 403)" : ` (code ${code})`;
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(`${retryMessage} ${stage}${state}`);
+    expect((failure as Error).cause).toBeUndefined();
+    expect(sql).toHaveBeenCalledTimes(failedRequest + 1);
+    expect(client.fs.exists).toHaveBeenCalledTimes(restoreCalls);
+    expect(console.log).not.toHaveBeenCalledWith(expect.stringContaining("Done!"));
+    expect(await readFile(join(dir, ".wiki9", "restore-incomplete"), "utf-8")).toContain("Retry wiki9 init");
+    const operations = await readFile(join(dir, ".wiki9", "operations.jsonl"), "utf-8");
+    const records = operations.trim().split("\n").map((line) => JSON.parse(line));
+    expect(records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ operation: "schema", outcome: "failed" }),
+      expect.objectContaining({ operation: "init", outcome: "failed" }),
+    ]));
+    const output = [String(failure), operations, ...vi.mocked(console.log).mock.calls.flat(),
+      ...vi.mocked(console.error).mock.calls.flat()].join("\n");
+    expect(output).not.toMatch(/SECRET|\u001b|SQL and credentials/);
+    await expect(syncCommand()).rejects.toThrow(/restore is incomplete/);
+    await initCommand("test-db", undefined);
+    await expect(lstat(join(dir, ".wiki9", "restore-incomplete"))).rejects.toMatchObject({ code: "ENOENT" });
+    await syncCommand();
+  });
+
+  it("preserves a safe stage when the backend provides no valid state", async () => {
+    vi.mocked(initSchema).mockRejectedValueOnce(backendError("Schema init failed", new Error(secret)));
+    await expect(initCommand("test-db", undefined)).rejects.toThrow(`${retryMessage} Schema init failed`);
+  });
+
+  it.each([
+    ["message prefix", () => new Error(`Schema init failed (code 42501) ${secret}`)],
+    ["error name", () => Object.assign(new Error(secret), { name: "BackendError" })],
+    ["object name", () => ({ name: "BackendError", message: secret, code: "42501", status: 403 })],
+    ["status fields", () => Object.assign(new Error(secret), { code: "42501", status: 403, cause: secret })],
+    ["string", () => secret],
+    ["null", () => null],
+  ])("redacts untrusted schema and file errors with %s", async (_label, makeError) => {
+    for (const phase of ["schema", "restore"]) {
+      if (phase === "schema") vi.mocked(initSchema).mockRejectedValueOnce(makeError());
+      else vi.mocked(client.fs.exists).mockRejectedValueOnce(makeError());
+      const failure = await initCommand("test-db", undefined).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toBe(retryMessage);
+      expect((failure as Error).cause).toBeUndefined();
+      expect(console.log).not.toHaveBeenCalledWith(expect.stringContaining("Done!"));
+      await expect(syncCommand()).rejects.toThrow(/restore is incomplete/);
+    }
   });
 });

@@ -12,6 +12,7 @@ import type { Db9Client } from "get-db9";
 import { ensureSafeDirectory, isNotFound, readSafeFile, remoteChildPath, writeSafeFileIfMissing } from "../utils/paths.js";
 import { displayText } from "../utils/output.js";
 import { operationRecorder, type OperationRecorder } from "../utils/operations.js";
+import { isBackendError } from "../utils/errors.js";
 
 async function ensureDir(path: string) {
   await ensureSafeDirectory(process.cwd(), path, true, 0o700);
@@ -210,8 +211,9 @@ async function initialize(db: string, token: string | undefined, name: string | 
     const pulledSources = await pullRemoteTree(client, db, dir, "/sources");
     const pulledLog = await pullRemoteFile(client, db, dir, "/log.md");
     console.log(`  pulled ${pulledWiki} wiki files, ${pulledSources} source files${pulledLog ? ", 1 log file" : ""}`);
-  } catch {
-    throw new Error("Initialization or remote restore failed. Retry `wiki9 init` before syncing.");
+  } catch (error) {
+    const details = isBackendError(error) ? ` ${error.message}` : "";
+    throw new Error(`Initialization or remote restore failed. Retry \`wiki9 init\` before syncing.${details}`);
   }
 
   // Write log.md
